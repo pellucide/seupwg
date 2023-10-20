@@ -107,7 +107,7 @@ else
     echo -n "public:" && cat publickey.script
     echo -n "private:" && cat privatekey.script
     echo -n "preshared:" && cat presharedkey.script
-    sudo ip link add dev $INTERFACE type wireguard
+    runCmd sudo ip link add dev $INTERFACE type wireguard
 
     if [ -z "$generateFlag" ]; then
         if [ -z "$privatekeyfromcommandline" ]; then
