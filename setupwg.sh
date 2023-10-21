@@ -90,7 +90,7 @@ else
         fi
     elif [ "$1" == "create" ]; then
         shift 1
-        while getopts ":hs:r:w:l:p:i:e:" o; do
+        while getopts ":hs:r:w:l:p:b:i:e:" o; do
             case "${o}" in
                 s) presharedkeyfromcommandline=${OPTARG}
                 ;;
