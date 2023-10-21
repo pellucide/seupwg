@@ -5,7 +5,7 @@ MANAGERIP=${BASEIP}.1
 EDGEIP=${BASEIP}.2
 MASK="32"
 LISTENPORT=33321
-#EXTRA_ALLOWED_IP=",0.0.0.0/0"
+EXTRA_ALLOWED_IP=",0.0.0.0/0"
 INSTALL_SCRIPT_COUNT=1
 
 function runCmd() {
@@ -28,8 +28,8 @@ function usage() {
     echo "Usage:"
     echo "$0 -> this help"
     echo "$0 clean [ -w wireguardinterface ] -> Cleanup interfaces"
-    echo "$0 create [-s presharedkey] [ -w wireguardinterface ] [ -r privatekey ] [ -l peerpublickey ] [ -i publicip ] [ -e edgeip ] -> Create interfaces"
-    echo "$0 generate < -i publicip > [ -w wireguardinterface ] [ -c count ] -> Setup local interface and generate 'count' install scripts for peers"
+    echo "$0 create [-s presharedkey] [ -w wireguardinterface ] [ -r privatekey ] [ -l peerpublickey ] [ -i publicip ] [ -e edgeip ] [ -p port ] [ -b baseip ] -> Create interfaces"
+    echo "$0 generate < -i publicip > [ -w wireguardinterface ] [ -c count ] [ -p port ] [ -b baseip ] -> Setup local interface and generate 'count' install scripts for peers"
     exit 1
 }
 
@@ -58,13 +58,19 @@ else
     if [ "$1" == "generate" ]; then
         generateFlag=1
         shift 1
-        while getopts ":hi:w:c:" o; do
+        while getopts ":hi:w:b:p:c:" o; do
             case "${o}" in
                 i) publicipfromcommandline=${OPTARG}
                 ;;
                 c) INSTALL_SCRIPT_COUNT=${OPTARG}
                 ;;
+                p) LISTENPORT=${OPTARG}
+                ;;
                 w) INTERFACE=${OPTARG}
+                ;;
+                b) BASEIP=${OPTARG}
+		   MANAGERIP=${BASEIP}.1
+		   EDGEIP=${BASEIP}.2
                 ;;
                 *|h) usage
                 ;;
@@ -84,7 +90,7 @@ else
         fi
     elif [ "$1" == "create" ]; then
         shift 1
-        while getopts ":hs:r:w:l:i:e:" o; do
+        while getopts ":hs:r:w:l:p:i:e:" o; do
             case "${o}" in
                 s) presharedkeyfromcommandline=${OPTARG}
                 ;;
@@ -94,7 +100,13 @@ else
                 ;;
                 i) publicipfromcommandline=${OPTARG}
                 ;;
+                p) LISTENPORT=${OPTARG}
+                ;;
                 w) INTERFACE=${OPTARG}
+                ;;
+                b) BASEIP=${OPTARG}
+		   MANAGERIP=${BASEIP}.1
+		   EDGEIP=${BASEIP}.2
                 ;;
                 e) EDGEIP=${OPTARG}
                 ;;
@@ -211,7 +223,7 @@ else
                 echo "sudo wg set $INTERFACE listen-port $LISTENPORT private-key privatekey.${INTERFACE}.script peer $publickey allowed-ips ${MANAGERIP}/${MASK}${EXTRA_ALLOWED_IP} preshared-key presharedkey.${INTERFACE}.script endpoint $peerpublicip:$LISTENPORT persistent-keepalive 20"
                 echo "ip link set up dev $INTERFACE"
                 echo ==============  Or if this script is available, then run the script as below\(copy/paste\)=====================
-                echo "./setupwg.sh create -w ${INTERFACE} -s $presharedkey -r $peerprivatekey -l $publickey -i $peerpublicip -e $EDGEIP"
+                echo "./setupwg.sh create -w ${INTERFACE} -p ${LISTENPORT} -s $presharedkey -r $peerprivatekey -l $publickey -i $peerpublicip -e $EDGEIP"
                 echo ==============================================================================================================
                 WG_COMMAND="$WG_COMMAND peer $peerpublickey allowed-ips ${EDGEIP}/${MASK}${EXTRA_ALLOWED_IP} preshared-key presharedkey${ii}.${INTERFACE}.script persistent-keepalive 20"
             done
