@@ -223,7 +223,7 @@ else
                 echo "sudo wg set $INTERFACE listen-port $LISTENPORT private-key privatekey.${INTERFACE}.script peer $publickey allowed-ips ${MANAGERIP}/${MASK}${EXTRA_ALLOWED_IP} preshared-key presharedkey.${INTERFACE}.script endpoint $peerpublicip:$LISTENPORT persistent-keepalive 20"
                 echo "ip link set up dev $INTERFACE"
                 echo ==============  Or if this script is available, then run the script as below\(copy/paste\)=====================
-                echo "./setupwg.sh create -w ${INTERFACE} -p ${LISTENPORT} -s $presharedkey -r $peerprivatekey -l $publickey -i $peerpublicip -e $EDGEIP"
+                echo "./setupwg.sh create -w ${INTERFACE} -b ${BASEIP} -p ${LISTENPORT} -s $presharedkey -r $peerprivatekey -l $publickey -i $peerpublicip -e $EDGEIP"
                 echo ==============================================================================================================
                 WG_COMMAND="$WG_COMMAND peer $peerpublickey allowed-ips ${EDGEIP}/${MASK}${EXTRA_ALLOWED_IP} preshared-key presharedkey${ii}.${INTERFACE}.script persistent-keepalive 20"
             done
