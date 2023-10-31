@@ -1,5 +1,5 @@
 #!/bin/bash
-INTERFACE="wg0"
+INTERFACE="wg999"
 BASEIP="192.168.88"
 MANAGERIP=${BASEIP}.1
 EDGEIP=${BASEIP}.2
@@ -7,10 +7,17 @@ MASK="32"
 LISTENPORT=33321
 EXTRA_ALLOWED_IP=",0.0.0.0/0"
 INSTALL_SCRIPT_COUNT=1
+DRYRUN=
+VERBOSE=true
 
 function runCmd() {
-    echo "executing.. $*" >&2
-    #"$@"
+    if [ ! -z "$VERBOSE" ]; then
+        echo "executing.. $*" >&2
+    fi
+
+    if [ -z "$DRYRUN" ]; then
+        "$@"
+    fi
 }
 
 die() {
@@ -133,6 +140,7 @@ else
         shift $((OPTIND-1))
     else
         usage
+        exit 1
     fi
 
     #interfaceStatus
@@ -172,7 +180,6 @@ else
     if ! interfaceStatus; then
         runCmd sudo ip link add dev "$INTERFACE" type wireguard
     fi
-    exit
 
 
     if [ -z "$generateFlag" ]; then
@@ -180,61 +187,51 @@ else
         runCmd sudo ip addr add dev "$INTERFACE" "$EDGEIP" peer "${MANAGERIP}"
 
         if [ -z "$publickeyfromcommandline" ]; then
-            echo -n "Enter the public key of manager:"
-            read -r peerpublickey
-            #wg set $INTERFACE listen-port $LISTENPORT private-key privatekey.${INTERFACE}.script peer $peerpublickey allowed-ips ${MANAGERIP}/${MASK}${EXTRA_ALLOWED_IP} preshared-key presharedkey.${INTERFACE}.script persistent-keepalive 20
-        else
-            peerpublickey=$publickeyfromcommandline
+            echo -n "Peer public key has to be provided:"
+            usage
+            exit 1
         fi
+        peerpublickey=$publickeyfromcommandline
 
         if [ -z "$publicipfromcommandline" ]; then
-            echo -n "Enter the public IP of manager:"
-            read -r peerpublicip
-        else
-            peerpublicip=$publicipfromcommandline
+            echo -n "Endpoing public IP is required."
+            usage
+            exit 1
         fi
+        peerpublicip=$publicipfromcommandline
 
         runCmd sudo wg set "$INTERFACE" listen-port "$LISTENPORT" private-key privatekey."${INTERFACE}".script peer "$peerpublickey" allowed-ips "${MANAGERIP}"/${MASK}${EXTRA_ALLOWED_IP}  preshared-key presharedkey."${INTERFACE}".script  endpoint "$peerpublicip":"$LISTENPORT" persistent-keepalive 20
     else
         runCmd sudo ip addr add dev "$INTERFACE" "${MANAGERIP}"/${MASK}
         #runCmd sudo ip addr add dev $INTERFACE ${MANAGERIP} peer ${EDGEIP}
-        WG_COMMAND="sudo wg set $INTERFACE listen-port $LISTENPORT private-key privatekey.${INTERFACE}.script"
 
         peerpublicip=$publicipfromcommandline
         publickey=$(cat publickey."${INTERFACE}".script)
-        echo =========================================================
-        echo "public     : $publickey"
-        echo "publicipfromcommandline: $publicipfromcommandline"
-        echo =========================================================
         for ii in $(seq 1 $INSTALL_SCRIPT_COUNT); do
             wg genpsk > presharedkey"${ii}"."${INTERFACE}".script
             presharedkey=$(cat presharedkey"${ii}"."${INTERFACE}".script)
             EDGEIP=${BASEIP}.$((ii+1))
-            umask 033
+            umask 077
             wg genkey | tee privatekeypeer."${INTERFACE}".script | wg pubkey > publickeypeer."${INTERFACE}".script
             peerpublickey=$(cat publickeypeer."${INTERFACE}".script)
             peerprivatekey=$(cat privatekeypeer."${INTERFACE}".script)
             echo
-            echo "========================================================="
-            echo "peerpublic : $peerpublickey"
-            echo "peerprivate: $peerprivatekey"
-            echo "preshared  : $presharedkey"
-            echo "========================================================="
-            echo "Commands to execute on the peer $ii"
-            echo "=============   Either the following set of commands ======================================================="
-            echo "ip link add dev $INTERFACE type wireguard"
-            echo "ip addr add dev $INTERFACE ${EDGEIP}/${MASK}"
-            #echo "ip addr add dev $INTERFACE ${EDGEIP} peer ${MANAGERIP}"
-            echo "echo '$peerprivatekey' > privatekey.${INTERFACE}.script"
-            echo "echo '$presharedkey' > presharedkey.${INTERFACE}.script"
-            echo "sudo wg set $INTERFACE listen-port $LISTENPORT private-key privatekey.${INTERFACE}.script peer $publickey allowed-ips ${MANAGERIP}/${MASK}${EXTRA_ALLOWED_IP} preshared-key presharedkey.${INTERFACE}.script endpoint $peerpublicip:$LISTENPORT persistent-keepalive 20"
-            echo "ip link set up dev $INTERFACE"
-            echo "==============  Or if this script is available, then run the script as below\(copy/paste\)====================="
-            echo "./setupwg.sh create -w ${INTERFACE} -b ${BASEIP} -p ${LISTENPORT} -s $presharedkey -r $peerprivatekey -l $publickey -i $peerpublicip -e $EDGEIP"
-            echo "=============================================================================================================="
-            WG_COMMAND="$WG_COMMAND peer $peerpublickey allowed-ips ${EDGEIP}/${MASK}${EXTRA_ALLOWED_IP} preshared-key presharedkey${ii}.${INTERFACE}.script persistent-keepalive 20"
+            echo "============== Execute the following set of commands ======================================================="
+            echo "  ip link add dev $INTERFACE type wireguard     &&    ip addr add dev $INTERFACE ${EDGEIP}/${MASK}"
+            #echo "  ip addr add dev $INTERFACE ${EDGEIP} peer ${MANAGERIP}"
+            echo "  echo '$peerprivatekey' > privatekey.${INTERFACE}.script"
+            echo "  echo '$presharedkey' > presharedkey.${INTERFACE}.script"
+            echo "  sudo wg set $INTERFACE listen-port $LISTENPORT private-key privatekey.${INTERFACE}.script \\ "
+            echo "       peer $publickey allowed-ips ${MANAGERIP}/${MASK}${EXTRA_ALLOWED_IP} \\"
+            echo "       preshared-key presharedkey.${INTERFACE}.script endpoint $peerpublicip:$LISTENPORT persistent-keepalive 20"
+            echo "  ip link set up dev $INTERFACE"
+            echo "============== Or if this script is available, then run the script as below(copy/paste)====================="
+            echo "  ./setupwg.sh create -w ${INTERFACE} -b ${BASEIP} -p ${LISTENPORT} -s $presharedkey \\ "
+            echo "       -r $peerprivatekey -l $publickey \\ "
+            echo "       -i $peerpublicip -e $EDGEIP"
+            echo "============================================================================================================"
+            runCmd sudo wg set $INTERFACE listen-port $LISTENPORT private-key privatekey.${INTERFACE}.script peer $peerpublickey allowed-ips ${EDGEIP}/${MASK}${EXTRA_ALLOWED_IP} preshared-key presharedkey${ii}.${INTERFACE}.script persistent-keepalive 20
         done
-        runCmd "$WG_COMMAND"
 
     fi
 
