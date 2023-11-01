@@ -39,19 +39,44 @@ function getCurrentWireguardSetting() {
     sudo wg show $INTERFACE "$1"
 }
 
+function checkCommand() {
+    "$1" &> /dev/null
+}
+
 
 function usage() {
     echo "Usage:"
     echo "$0 -> this help"
-    echo "$0 clean [ -w wireguardinterface ] -> Cleanup interfaces"
-    echo "$0 create [-s presharedkey] [ -w wireguardinterface ] [ -r privatekey ] [ -l peerpublickey ] [ -i publicip ] [ -e edgeip ] [ -p port ] [ -b baseip ] -> Create interfaces"
-    echo "$0 generate < -i publicip > [ -w wireguardinterface ] [ -c count ] [ -p port ] [ -b baseip ] -> Setup local interface and generate 'count' install scripts for peers"
+    echo "$0 clean [-w wireguardinterface] -> Delete the interface"
+    echo "$0 create [-s presharedkey] [-w wireguardinterface] [-r privatekey] [-l peerpublickey] [-i publicip] [-e edgeip] [-p port] [-b baseip] -> Create interfaces"
+    echo "$0 generate [-i publicip] [-w wireguardinterface] [-c count] [-p port] [-b baseip] -> Setup local interface and generate 'count' install scripts for peers"
     exit 1
 }
+
+if ! checkCommand "wg"; then
+    echo "The command wg not found. Please install wireguard-tools"
+    usage
+    exit 1
+fi
+
+if ! checkCommand "curl"; then
+    echo "The command curl not found. Please install curl"
+    usage
+    exit 1
+fi
+
+if ! checkCommand "ip"; then
+    echo "The command ip not found. Please install iproute2"
+    usage
+    exit 1
+fi
+
 
 if [ "$#" == "0" ]; then
     usage
 fi
+
+
 
 if [ "$1" == "clean" ]; then
     shift 1
@@ -143,7 +168,6 @@ else
         exit 1
     fi
 
-    #interfaceStatus
     if interfaceStatus; then
         echo
         echo "Interface $INTERFACE exists. This script will use exiting settings !!!"
