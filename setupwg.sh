@@ -40,7 +40,7 @@ function getCurrentWireguardSetting() {
 }
 
 function checkCommand() {
-    "$1" &> /dev/null
+    type $1 &> /dev/null
 }
 
 
@@ -52,13 +52,6 @@ function usage() {
     echo "$0 generate [-i publicip] [-w wireguardinterface] [-c count] [-p port] [-b baseip] -> Setup local interface and generate 'count' install scripts for peers"
     exit 1
 }
-
-if ! checkCommand "wg"; then
-    echo "The command wg not found. Please install wireguard-tools"
-    usage
-    exit 1
-fi
-
 if ! checkCommand "curl"; then
     echo "The command curl not found. Please install curl"
     usage
@@ -70,6 +63,13 @@ if ! checkCommand "ip"; then
     usage
     exit 1
 fi
+
+if ! checkCommand "wg"; then
+    echo "The command wg not found. Please install wireguard-tools"
+    usage
+    exit 1
+fi
+
 
 
 if [ "$#" == "0" ]; then
