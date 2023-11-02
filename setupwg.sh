@@ -5,9 +5,10 @@ MANAGERIP=${BASEIP}.1
 EDGEIP=${BASEIP}.2
 MASK="32"
 LISTENPORT=33321
-EXTRA_ALLOWED_IP=",0.0.0.0/0"
+EXTRA_ALLOWED_IP="0.0.0.0/0"
 INSTALL_SCRIPT_COUNT=1
-DRYRUN=
+KEEPALIVE_TIMEOUT=20
+DRYRUN=true
 VERBOSE=true
 
 function runCmd() {
@@ -39,8 +40,27 @@ function getCurrentWireguardSetting() {
     sudo wg show $INTERFACE "$1"
 }
 
+function getBaseIPCurrentWireguardSetting() {
+    sudo wg show $INTERFACE allowed-ips | head -1 | cut -f2 | cut -d'.' -f-3
+}
+
 function checkCommand() {
     type $1 &> /dev/null
+}
+
+function findFreeIP() {
+    BASEIP_CURRENT1=$(getBaseIPCurrentWireguardSetting)
+    if [ ! -z $BASEIP_CURRENT ]; then
+         BASEIP=$BASEIP_CURRENT
+    fi
+    lastIP=$(sudo wg show $INTERFACE allowed-ips | cut -f2 | cut -d'.' -f4 | cut -d'/' -f1 | sort | uniq | sed --expression='/\(none\)/d' | tail -1)
+
+    if [ -z $lastIP ]; then 
+        lastIP=2;
+    else
+	lastIP=$((lastIP+1))
+    fi
+    echo ${BASEIP}.${lastIP}
 }
 
 
@@ -113,7 +133,7 @@ else
                 ;;
                 b) BASEIP=${OPTARG}
                    MANAGERIP=${BASEIP}.1
-                   EDGEIP=${BASEIP}.2
+		   EDGEIP=${BASEIP}.2
                 ;;
                 h) usage
                 ;;
@@ -168,10 +188,15 @@ else
         exit 1
     fi
 
+
+
     if interfaceStatus; then
         echo
         echo "Interface $INTERFACE exists. This script will use exiting settings !!!"
         privatekeyfromcommandline=$(getCurrentWireguardSetting "private-key")
+        BASEIP=$(getBaseIPCurrentWireguardSetting)
+        MANAGERIP=${BASEIP}.1
+	EDGEIP=$(findFreeIP)
         LISTENPORT=$(getCurrentWireguardSetting "listen-port")
     fi
 
@@ -224,7 +249,7 @@ else
         fi
         peerpublicip=$publicipfromcommandline
 
-        runCmd sudo wg set "$INTERFACE" listen-port "$LISTENPORT" private-key privatekey."${INTERFACE}".script peer "$peerpublickey" allowed-ips "${MANAGERIP}"/${MASK}${EXTRA_ALLOWED_IP}  preshared-key presharedkey."${INTERFACE}".script  endpoint "$peerpublicip":"$LISTENPORT" persistent-keepalive 20
+        runCmd sudo wg set "$INTERFACE" listen-port "$LISTENPORT" private-key privatekey."${INTERFACE}".script peer "$peerpublickey" allowed-ips "${MANAGERIP}"/${MASK},${EXTRA_ALLOWED_IP}  preshared-key presharedkey."${INTERFACE}".script  endpoint "$peerpublicip":"$LISTENPORT" persistent-keepalive $KEEPALIVE_TIMEOUT
     else
         runCmd sudo ip addr add dev "$INTERFACE" "${MANAGERIP}"/${MASK}
         #runCmd sudo ip addr add dev $INTERFACE ${MANAGERIP} peer ${EDGEIP}
@@ -234,7 +259,8 @@ else
         for ii in $(seq 1 $INSTALL_SCRIPT_COUNT); do
             wg genpsk > presharedkey"${ii}"."${INTERFACE}".script
             presharedkey=$(cat presharedkey"${ii}"."${INTERFACE}".script)
-            EDGEIP=${BASEIP}.$((ii+1))
+            #EDGEIP=${BASEIP}.$((ii+1))
+	    EDGEIP=$(findFreeIP)
             umask 077
             wg genkey | tee privatekeypeer."${INTERFACE}".script | wg pubkey > publickeypeer."${INTERFACE}".script
             peerpublickey=$(cat publickeypeer."${INTERFACE}".script)
@@ -246,17 +272,34 @@ else
             echo "  echo '$peerprivatekey' > privatekey.${INTERFACE}.script"
             echo "  echo '$presharedkey' > presharedkey.${INTERFACE}.script"
             echo "  sudo wg set $INTERFACE listen-port $LISTENPORT private-key privatekey.${INTERFACE}.script \\"
-            echo "       peer $publickey allowed-ips ${MANAGERIP}/${MASK}${EXTRA_ALLOWED_IP} \\"
-            echo "       preshared-key presharedkey.${INTERFACE}.script endpoint $peerpublicip:$LISTENPORT persistent-keepalive 20"
+            echo "       peer $publickey allowed-ips ${MANAGERIP}/${MASK},${EXTRA_ALLOWED_IP} \\"
+            echo "       preshared-key presharedkey.${INTERFACE}.script endpoint $peerpublicip:$LISTENPORT persistent-keepalive $KEEPALIVE_TIMEOUT"
             echo "  ip link set up dev $INTERFACE"
             echo "============== Or if this script is available, then run the script as below(copy/paste)====================="
             echo "  ./setupwg.sh create -w ${INTERFACE} -b ${BASEIP} -p ${LISTENPORT} -s $presharedkey \\"
             echo "       -r $peerprivatekey -l $publickey \\"
             echo "       -i $peerpublicip -e $EDGEIP"
             echo "============================================================================================================"
-            runCmd sudo wg set $INTERFACE listen-port $LISTENPORT private-key privatekey.${INTERFACE}.script peer $peerpublickey allowed-ips ${EDGEIP}/${MASK}${EXTRA_ALLOWED_IP} preshared-key presharedkey${ii}.${INTERFACE}.script persistent-keepalive 20
-        done
+	    echo " "
+	    echo "[Interface]"                                        | tee    "config.peer.$EDGEIP"
+	    echo "ListenPort = $LISTENPORT"                           | tee -a "config.peer.$EDGEIP"
+	    echo "PrivateKey = $peerprivatekey"                       | tee -a "config.peer.$EDGEIP"
+	    echo " "                                                  | tee -a "config.peer.$EDGEIP"
+	    echo "[Peer]"                                             | tee -a "config.peer.$EDGEIP"
+	    echo "PublicKey = $publickey"                             | tee -a "config.peer.$EDGEIP"
+	    echo "PreshareKey = $presharedkey"                        | tee -a "config.peer.$EDGEIP"
+	    echo "AllowedIPs = ${EDGEIP}/${MASK},${EXTRA_ALLOWED_IP}" | tee -a "config.peer.$EDGEIP"
+	    echo "Endpoint = ${peerpublicip}:${LISTENPORT}"           | tee -a "config.peer.$EDGEIP"
+	    echo "PersistentKeepalive = $KEEPALIVE_TIMEOUT"           | tee -a "config.peer.$EDGEIP"
+	    echo " "
+            echo "============================================================================================================"
 
+            if checkCommand "qrencode"; then
+                qrencode -r  "config.peer.$EDGEIP" -o  "config.peer.$EDGEIP.png"
+            fi
+
+            runCmd sudo wg set $INTERFACE listen-port $LISTENPORT private-key privatekey.${INTERFACE}.script peer $peerpublickey allowed-ips ${EDGEIP}/${MASK},${EXTRA_ALLOWED_IP} preshared-key presharedkey${ii}.${INTERFACE}.script persistent-keepalive $KEEPALIVE_TIMEOUT
+        done
     fi
 
     runCmd sudo ip link set up dev "$INTERFACE"
