@@ -297,6 +297,8 @@ else
 
             if checkCommand "qrencode"; then
                 qrencode -r  "config.peer.$EDGEIP" -o  "config.peer.$EDGEIP.png"
+            else
+                echo "Install qrencode to produce qrcodes"
             fi
 
             runCmd sudo wg set $INTERFACE listen-port $LISTENPORT private-key privatekey.${INTERFACE}.script peer $peerpublickey allowed-ips ${EDGEIP}/${MASK},${EXTRA_ALLOWED_IP} preshared-key presharedkey${ii}.${INTERFACE}.script persistent-keepalive $KEEPALIVE_TIMEOUT
