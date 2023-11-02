@@ -284,6 +284,7 @@ else
 	    echo "[Interface]"                                        | tee    "config.peer.$EDGEIP"
 	    echo "ListenPort = $LISTENPORT"                           | tee -a "config.peer.$EDGEIP"
 	    echo "PrivateKey = $peerprivatekey"                       | tee -a "config.peer.$EDGEIP"
+	    echo "Address = $EDGEIP"                                  | tee -a "config.peer.$EDGEIP"
 	    echo " "                                                  | tee -a "config.peer.$EDGEIP"
 	    echo "[Peer]"                                             | tee -a "config.peer.$EDGEIP"
 	    echo "PublicKey = $publickey"                             | tee -a "config.peer.$EDGEIP"
@@ -303,5 +304,7 @@ else
     fi
 
     runCmd sudo ip link set up dev "$INTERFACE"
-    runCmd sudo ip route add "${BASEIP}".0/24 dev "$INTERFACE"
+    if ! interfaceStatus; then
+        runCmd sudo ip route add "${BASEIP}".0/24 dev "$INTERFACE"
+    fi
 fi
