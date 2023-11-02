@@ -8,7 +8,7 @@ LISTENPORT=33321
 EXTRA_ALLOWED_IP="0.0.0.0/0"
 INSTALL_SCRIPT_COUNT=1
 KEEPALIVE_TIMEOUT=20
-DRYRUN=true
+DRYRUN=
 VERBOSE=true
 
 function runCmd() {
@@ -287,7 +287,7 @@ else
 	    echo " "                                                  | tee -a "config.peer.$EDGEIP"
 	    echo "[Peer]"                                             | tee -a "config.peer.$EDGEIP"
 	    echo "PublicKey = $publickey"                             | tee -a "config.peer.$EDGEIP"
-	    echo "PreshareKey = $presharedkey"                        | tee -a "config.peer.$EDGEIP"
+	    echo "PresharedKey = $presharedkey"                       | tee -a "config.peer.$EDGEIP"
 	    echo "AllowedIPs = ${EDGEIP}/${MASK},${EXTRA_ALLOWED_IP}" | tee -a "config.peer.$EDGEIP"
 	    echo "Endpoint = ${peerpublicip}:${LISTENPORT}"           | tee -a "config.peer.$EDGEIP"
 	    echo "PersistentKeepalive = $KEEPALIVE_TIMEOUT"           | tee -a "config.peer.$EDGEIP"
