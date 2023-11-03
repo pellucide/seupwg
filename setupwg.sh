@@ -189,15 +189,20 @@ else
     fi
 
 
-
     if interfaceStatus; then
         echo
         echo "Interface $INTERFACE exists. This script will use exiting settings !!!"
         privatekeyfromcommandline=$(getCurrentWireguardSetting "private-key")
         BASEIP=$(getBaseIPCurrentWireguardSetting)
         MANAGERIP=${BASEIP}.1
-	EDGEIP=$(findFreeIP)
+        EDGEIP=$(findFreeIP)
         LISTENPORT=$(getCurrentWireguardSetting "listen-port")
+
+        echo "privatekeyfromcommandline = $privatekeyfromcommandline"
+        echo "BASEIP = $BASEIP"
+        echo "MANAGERIP = $MANAGERIP"
+        echo "EDGEIP = $EDGEIP"
+        echo "LISTENPORT = $LISTENPORT"
     fi
 
     umask 077
