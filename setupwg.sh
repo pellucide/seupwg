@@ -306,7 +306,5 @@ else
     fi
 
     runCmd sudo ip link set up dev "$INTERFACE"
-    if ! interfaceStatus; then
-        runCmd sudo ip route add "${BASEIP}".0/24 dev "$INTERFACE"
-    fi
+    runCmd sudo ip route add "${BASEIP}".0/24 dev "$INTERFACE"
 fi
