@@ -285,6 +285,8 @@ else
 	    echo "ListenPort = $LISTENPORT"                           | tee -a "config.peer.$EDGEIP"
 	    echo "PrivateKey = $peerprivatekey"                       | tee -a "config.peer.$EDGEIP"
 	    echo "Address = $EDGEIP"                                  | tee -a "config.peer.$EDGEIP"
+	    echo "DNS = 1.1.1.1"                                      | tee -a "config.peer.$EDGEIP"
+	    echo "MTU = 1350"                                         | tee -a "config.peer.$EDGEIP"
 	    echo " "                                                  | tee -a "config.peer.$EDGEIP"
 	    echo "[Peer]"                                             | tee -a "config.peer.$EDGEIP"
 	    echo "PublicKey = $publickey"                             | tee -a "config.peer.$EDGEIP"
