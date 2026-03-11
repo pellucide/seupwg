@@ -49,13 +49,13 @@ function checkCommand() {
 }
 
 function findFreeIP() {
-    BASEIP_CURRENT1=$(getBaseIPCurrentWireguardSetting)
-    if [ ! -z $BASEIP_CURRENT ]; then
+    BASEIP_CURRENT=$(getBaseIPCurrentWireguardSetting)
+    if [ ! -z "$BASEIP_CURRENT" ]; then
          BASEIP=$BASEIP_CURRENT
     fi
     lastIP=$(sudo wg show $INTERFACE allowed-ips | cut -f2 | cut -d'.' -f4 | cut -d'/' -f1 | sort | uniq | sed --expression='/\(none\)/d' | tail -1)
 
-    if [ -z $lastIP ]; then 
+    if [ -z "$lastIP" ]; then 
         lastIP=2;
     else
 	lastIP=$((lastIP+1))
