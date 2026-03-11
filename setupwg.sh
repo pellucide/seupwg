@@ -151,6 +151,12 @@ else
         done
         shift $((OPTIND-1))
 
+        if [ $# -ne 0 ]; then
+            echo "Error: Unexpected arguments: $*"
+            usage
+            exit 1
+        fi
+
         if [ -z "$publicipfromcommandline" ]; then
             publicipfromcommandline=$(getPublicIp)
             if [ -z "$publicipfromcommandline" ]; then
@@ -199,6 +205,12 @@ else
             esac
         done
         shift $((OPTIND-1))
+
+        if [ $# -ne 0 ]; then
+            echo "Error: Unexpected arguments: $*"
+            usage
+            exit 1
+        fi
     else
         usage
         exit 1
