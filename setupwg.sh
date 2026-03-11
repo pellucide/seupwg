@@ -1,4 +1,6 @@
 #!/bin/bash
+set -o pipefail
+PROGRAM="${0##*/}"
 INTERFACE="wg999"
 BASEIP="192.168.88"
 MANAGERIP=${BASEIP}.1
@@ -248,7 +250,7 @@ else
         peerpublickey=$publickeyfromcommandline
 
         if [ -z "$publicipfromcommandline" ]; then
-            echo -n "Endpoing public IP is required."
+            echo "Error: Endpoint public IP is required."
             usage
             exit 1
         fi
