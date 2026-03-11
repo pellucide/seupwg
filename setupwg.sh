@@ -10,6 +10,8 @@ LISTENPORT=33321
 EXTRA_ALLOWED_IP="0.0.0.0/0"
 INSTALL_SCRIPT_COUNT=1
 KEEPALIVE_TIMEOUT=20
+DNS_SERVER="1.1.1.1"
+MTU_VALUE=1350
 DRYRUN=
 VERBOSE=true
 
@@ -60,7 +62,7 @@ function findFreeIP() {
     if [ -z "$lastIP" ]; then 
         lastIP=2;
     else
-	lastIP=$((lastIP+1))
+        lastIP=$((lastIP+1))
     fi
     echo ${BASEIP}.${lastIP}
 }
@@ -123,7 +125,7 @@ else
     if [ "$1" == "generate" ]; then
         generateFlag=1
         shift 1
-        while getopts ":hi:w:b:p:c:" o; do
+        while getopts ":hi:w:b:p:c:d:m:" o; do
             case "${o}" in
                 i) publicipfromcommandline=${OPTARG}
                 ;;
@@ -135,7 +137,11 @@ else
                 ;;
                 b) BASEIP=${OPTARG}
                    MANAGERIP=${BASEIP}.1
-		   EDGEIP=${BASEIP}.2
+                   EDGEIP=${BASEIP}.2
+                ;;
+                d) DNS_SERVER=${OPTARG}
+                ;;
+                m) MTU_VALUE=${OPTARG}
                 ;;
                 h) usage
                 ;;
@@ -153,6 +159,10 @@ else
                 exit 1
             fi
         fi
+        if ! [[ "$INSTALL_SCRIPT_COUNT" =~ ^[0-9]+$ ]]; then
+            echo "Error: Invalid count: $INSTALL_SCRIPT_COUNT (must be a number)"
+            exit 1
+        fi
         if [ "$INSTALL_SCRIPT_COUNT" -lt 0 ]; then 
             INSTALL_SCRIPT_COUNT=1
         fi
@@ -161,7 +171,7 @@ else
         fi
     elif [ "$1" == "create" ]; then
         shift 1
-        while getopts ":hs:r:w:l:p:b:i:e:" o; do
+        while getopts ":hs:r:w:l:p:b:i:e:d:m:" o; do
             case "${o}" in
                 s) presharedkeyfromcommandline=${OPTARG}
                 ;;
@@ -179,6 +189,10 @@ else
                    MANAGERIP=${BASEIP}.1
                 ;;
                 e) EDGEIP=${OPTARG}
+                ;;
+                d) DNS_SERVER=${OPTARG}
+                ;;
+                m) MTU_VALUE=${OPTARG}
                 ;;
                 *) usage
                 ;;
@@ -267,7 +281,7 @@ else
             wg genpsk > presharedkey"${ii}"."${INTERFACE}".script
             presharedkey=$(cat presharedkey"${ii}"."${INTERFACE}".script)
             #EDGEIP=${BASEIP}.$((ii+1))
-	    EDGEIP=$(findFreeIP)
+        EDGEIP=$(findFreeIP)
             umask 077
             wg genkey | tee privatekeypeer."${INTERFACE}".script | wg pubkey > publickeypeer."${INTERFACE}".script
             peerpublickey=$(cat publickeypeer."${INTERFACE}".script)
@@ -287,21 +301,21 @@ else
             echo "       -r $peerprivatekey -l $publickey \\"
             echo "       -i $peerpublicip -e $EDGEIP"
             echo "============================================================================================================"
-	    echo " "
-	    echo "[Interface]"                                        | tee    "config.peer.$EDGEIP"
-	    echo "ListenPort = $LISTENPORT"                           | tee -a "config.peer.$EDGEIP"
-	    echo "PrivateKey = $peerprivatekey"                       | tee -a "config.peer.$EDGEIP"
-	    echo "Address = $EDGEIP"                                  | tee -a "config.peer.$EDGEIP"
-	    echo "DNS = 1.1.1.1"                                      | tee -a "config.peer.$EDGEIP"
-	    echo "MTU = 1350"                                         | tee -a "config.peer.$EDGEIP"
-	    echo " "                                                  | tee -a "config.peer.$EDGEIP"
-	    echo "[Peer]"                                             | tee -a "config.peer.$EDGEIP"
-	    echo "PublicKey = $publickey"                             | tee -a "config.peer.$EDGEIP"
-	    echo "PresharedKey = $presharedkey"                       | tee -a "config.peer.$EDGEIP"
-	    echo "AllowedIPs = ${EDGEIP}/${MASK},${EXTRA_ALLOWED_IP}" | tee -a "config.peer.$EDGEIP"
-	    echo "Endpoint = ${peerpublicip}:${LISTENPORT}"           | tee -a "config.peer.$EDGEIP"
-	    echo "PersistentKeepalive = $KEEPALIVE_TIMEOUT"           | tee -a "config.peer.$EDGEIP"
-	    echo " "
+        echo " "
+        echo "[Interface]"                                        | tee    "config.peer.$EDGEIP"
+        echo "ListenPort = $LISTENPORT"                           | tee -a "config.peer.$EDGEIP"
+        echo "PrivateKey = $peerprivatekey"                       | tee -a "config.peer.$EDGEIP"
+        echo "Address = $EDGEIP"                                  | tee -a "config.peer.$EDGEIP"
+        echo "DNS = $DNS_SERVER"                                  | tee -a "config.peer.$EDGEIP"
+        echo "MTU = $MTU_VALUE"                                   | tee -a "config.peer.$EDGEIP"
+        echo " "                                                  | tee -a "config.peer.$EDGEIP"
+        echo "[Peer]"                                             | tee -a "config.peer.$EDGEIP"
+        echo "PublicKey = $publickey"                             | tee -a "config.peer.$EDGEIP"
+        echo "PresharedKey = $presharedkey"                       | tee -a "config.peer.$EDGEIP"
+        echo "AllowedIPs = ${EDGEIP}/${MASK},${EXTRA_ALLOWED_IP}" | tee -a "config.peer.$EDGEIP"
+        echo "Endpoint = ${peerpublicip}:${LISTENPORT}"           | tee -a "config.peer.$EDGEIP"
+        echo "PersistentKeepalive = $KEEPALIVE_TIMEOUT"           | tee -a "config.peer.$EDGEIP"
+        echo " "
             echo "============================================================================================================"
 
             if checkCommand "qrencode"; then
