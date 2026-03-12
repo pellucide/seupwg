@@ -128,11 +128,26 @@ if [ "$1" == "clean" ]; then
             ;;
             h) usage
             ;;
-            *) usage
+            :) echo "Error: Option -${OPTARG} requires an argument"
+               usage
+               exit 1
+            ;;
+            ?) echo "Error: Invalid option: -${OPTARG}"
+               usage
+               exit 1
+            ;;
+            *) echo "Error: Unknown option"
+               usage
+               exit 1
             ;;
         esac
     done
     shift $((OPTIND-1))
+    if [ $# -ne 0 ]; then
+        echo "Error: Unexpected arguments: $*"
+        usage
+        exit 1
+    fi
     echo -n "Cleaning up the interface $INTERFACE. Are you sure[y/n]? "
     read -r response
     if [[ "$response" == "y" ]]; then
@@ -164,7 +179,17 @@ else
                 ;;
                 h) usage
                 ;;
-                *) usage
+                :) echo "Error: Option -${OPTARG} requires an argument"
+                   usage
+                   exit 1
+                ;;
+                ?) echo "Error: Invalid option: -${OPTARG}"
+                   usage
+                   exit 1
+                ;;
+                *) echo "Error: Unknown option"
+                   usage
+                   exit 1
                 ;;
             esac
         done
@@ -219,7 +244,17 @@ else
                 ;;
                 m) MTU_VALUE=${OPTARG}
                 ;;
-                *) usage
+                :) echo "Error: Option -${OPTARG} requires an argument"
+                   usage
+                   exit 1
+                ;;
+                ?) echo "Error: Invalid option: -${OPTARG}"
+                   usage
+                   exit 1
+                ;;
+                *) echo "Error: Unknown option"
+                   usage
+                   exit 1
                 ;;
             esac
         done
