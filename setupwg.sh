@@ -12,8 +12,9 @@ INSTALL_SCRIPT_COUNT=1
 KEEPALIVE_TIMEOUT=20
 DNS_SERVER="1.1.1.1"
 MTU_VALUE=1350
-DRYRUN=
-VERBOSE=true
+DRYRUN=${DRYRUN:-}
+VERBOSE=${VERBOSE:-true}
+DRYRUN_DIR="dryrun"
 
 function runCmd() {
     if [ ! -z "$VERBOSE" ]; then
@@ -22,6 +23,23 @@ function runCmd() {
 
     if [ -z "$DRYRUN" ]; then
         "$@"
+        return $?
+    else
+        return 0
+    fi
+}
+
+function getOutputDir() {
+    if [ -z "$DRYRUN" ]; then
+        echo "."
+    else
+        echo "$DRYRUN_DIR"
+    fi
+}
+
+function ensureDryRunDir() {
+    if [ ! -z "$DRYRUN" ] && [ ! -d "$DRYRUN_DIR" ]; then
+        mkdir -p "$DRYRUN_DIR"
     fi
 }
 
@@ -119,6 +137,7 @@ if [ "$1" == "clean" ]; then
     read -r response
     if [[ "$response" == "y" ]]; then
         rm -f privatekey."${INTERFACE}".script publickey."${INTERFACE}".script presharedkey*."${INTERFACE}".script publickeypeer."${INTERFACE}".script privatekeypeer."${INTERFACE}".script
+        rm -rf "$DRYRUN_DIR"
         runCmd sudo ip link delete dev "$INTERFACE"
     fi
 else
@@ -223,7 +242,12 @@ else
         privatekeyfromcommandline=$(getCurrentWireguardSetting "private-key")
         BASEIP=$(getBaseIPCurrentWireguardSetting)
         MANAGERIP=${BASEIP}.1
-        EDGEIP=$(findFreeIP)
+        if [ -z "$DRYRUN" ]; then
+            EDGEIP=$(findFreeIP)
+        else
+            # In DRYRUN, use simple incrementing IPs
+            EDGEIP="${BASEIP}.$((ii + 1))"
+        fi
         LISTENPORT=$(getCurrentWireguardSetting "listen-port")
 
         echo "privatekeyfromcommandline = $privatekeyfromcommandline"
@@ -233,71 +257,97 @@ else
         echo "LISTENPORT = $LISTENPORT"
     fi
 
+    ensureDryRunDir
+    OUTDIR=$(getOutputDir)
+    
     umask 077
     if [ -z "$privatekeyfromcommandline" ]; then
-        wg genkey | tee privatekey."${INTERFACE}".script | wg pubkey > publickey."${INTERFACE}".script
+        if [ -z "$DRYRUN" ]; then
+            wg genkey | tee "$OUTDIR/privatekey.${INTERFACE}.script" | wg pubkey > "$OUTDIR/publickey.${INTERFACE}.script"
+        else
+            # In dryrun, generate keys but don't read from existing files
+            wg genkey | tee "$OUTDIR/privatekey.${INTERFACE}.script" | wg pubkey > "$OUTDIR/publickey.${INTERFACE}.script"
+        fi
     else
-        echo "$privatekeyfromcommandline" > privatekey."${INTERFACE}".script
-        wg pubkey < privatekey."${INTERFACE}".script > publickey."${INTERFACE}".script
+        echo "$privatekeyfromcommandline" > "$OUTDIR/privatekey.${INTERFACE}.script"
+        wg pubkey < "$OUTDIR/privatekey.${INTERFACE}.script" > "$OUTDIR/publickey.${INTERFACE}.script"
     fi
 
     if [ -z "$presharedkeyfromcommandline" ]; then
-        if [ -z "$generateFlag" ]; then
+        if [ -z "$generateFlag" ] && [ -z "$DRYRUN" ]; then
             echo -n "If you have a preshared-key, enter it here:"
             read -r preshared
         fi
         if [ -z "$preshared" ]; then
-            wg genpsk > presharedkey."${INTERFACE}".script
+            wg genpsk > "$OUTDIR/presharedkey.${INTERFACE}.script"
         else
-            echo "$preshared" > presharedkey."${INTERFACE}".script
+            echo "$preshared" > "$OUTDIR/presharedkey.${INTERFACE}.script"
         fi
     else
-        echo "$presharedkeyfromcommandline" > presharedkey."${INTERFACE}".script
+        echo "$presharedkeyfromcommandline" > "$OUTDIR/presharedkey.${INTERFACE}.script"
     fi
-    echo -n "public:" && cat publickey."${INTERFACE}".script
-    echo -n "private:" && cat privatekey."${INTERFACE}".script
-    echo -n "preshared:" && cat presharedkey."${INTERFACE}".script
+    OUTDIR=$(getOutputDir)
+    echo "public:$(cat "$OUTDIR/publickey.${INTERFACE}.script")"
+    if [ -z "$DRYRUN" ]; then
+        echo "private:$(cat "$OUTDIR/privatekey.${INTERFACE}.script")"
+        echo "preshared:$(cat "$OUTDIR/presharedkey.${INTERFACE}.script")"
+    else
+        echo "[DRYRUN] Keys written to $OUTDIR/ directory"
+    fi
     echo -n "publicip: $publicipfromcommandline:$LISTENPORT"
     echo
-    if ! interfaceStatus; then
+    if [ -z "$DRYRUN" ] && ! interfaceStatus; then
         runCmd sudo ip link add dev "$INTERFACE" type wireguard
     fi
 
-
     if [ -z "$generateFlag" ]; then
-        runCmd sudo ip addr add dev "$INTERFACE" "$EDGEIP"/32
-        runCmd sudo ip addr add dev "$INTERFACE" "$EDGEIP" peer "${MANAGERIP}"
+        if ! runCmd sudo ip addr add dev "$INTERFACE" "$EDGEIP"/32 2>/dev/null; then
+            echo "Warning: Failed to add IP address $EDGEIP/32 (may already exist)"
+        fi
+        if ! runCmd sudo ip addr add dev "$INTERFACE" "$EDGEIP" peer "${MANAGERIP}" 2>/dev/null; then
+            echo "Warning: Failed to add peer IP (may already exist)"
+        fi
 
         if [ -z "$publickeyfromcommandline" ]; then
-            echo -n "Peer public key has to be provided:"
+            echo "Error: Peer public key has to be provided"
             usage
             exit 1
         fi
         peerpublickey=$publickeyfromcommandline
 
         if [ -z "$publicipfromcommandline" ]; then
-            echo "Error: Endpoint public IP is required."
+            echo "Error: Endpoint public IP is required"
             usage
             exit 1
         fi
         peerpublicip=$publicipfromcommandline
 
-        runCmd sudo wg set "$INTERFACE" listen-port "$LISTENPORT" private-key privatekey."${INTERFACE}".script peer "$peerpublickey" allowed-ips "${MANAGERIP}"/${MASK},${EXTRA_ALLOWED_IP}  preshared-key presharedkey."${INTERFACE}".script  endpoint "$peerpublicip":"$LISTENPORT" persistent-keepalive $KEEPALIVE_TIMEOUT
+        if ! runCmd sudo wg set "$INTERFACE" listen-port "$LISTENPORT" private-key "$OUTDIR/privatekey.${INTERFACE}.script" peer "$peerpublickey" allowed-ips "${MANAGERIP}"/${MASK},${EXTRA_ALLOWED_IP} preshared-key "$OUTDIR/presharedkey.${INTERFACE}.script" endpoint "$peerpublicip":"$LISTENPORT" persistent-keepalive "$KEEPALIVE_TIMEOUT"; then
+            echo "Error: Failed to configure WireGuard interface"
+            exit 1
+        fi
     else
-        runCmd sudo ip addr add dev "$INTERFACE" "${MANAGERIP}"/${MASK}
+        if [ -z "$DRYRUN" ]; then
+            runCmd sudo ip addr add dev "$INTERFACE" "${MANAGERIP}"/${MASK}
+        fi
         #runCmd sudo ip addr add dev $INTERFACE ${MANAGERIP} peer ${EDGEIP}
 
         peerpublicip=$publicipfromcommandline
-        publickey=$(cat publickey."${INTERFACE}".script)
+        publickey=$(cat "$OUTDIR/publickey.${INTERFACE}.script")
         for ii in $(seq 1 $INSTALL_SCRIPT_COUNT); do
-            wg genpsk > presharedkey"${ii}"."${INTERFACE}".script
-            presharedkey=$(cat presharedkey"${ii}"."${INTERFACE}".script)
+            wg genpsk > "$OUTDIR/presharedkey${ii}.${INTERFACE}.script"
+            presharedkey=$(cat "$OUTDIR/presharedkey${ii}.${INTERFACE}.script")
             #EDGEIP=${BASEIP}.$((ii+1))
-        EDGEIP=$(findFreeIP)
+        if [ -z "$DRYRUN" ]; then
+            EDGEIP=$(findFreeIP)
+        else
+            # In DRYRUN, use simple incrementing IPs
+            EDGEIP="${BASEIP}.$((ii + 1))"
+        fi
             umask 077
-            wg genkey | tee privatekeypeer."${INTERFACE}".script | wg pubkey > publickeypeer."${INTERFACE}".script
-            peerpublickey=$(cat publickeypeer."${INTERFACE}".script)
-            peerprivatekey=$(cat privatekeypeer."${INTERFACE}".script)
+            wg genkey | tee "$OUTDIR/privatekeypeer.${INTERFACE}.script" | wg pubkey > "$OUTDIR/publickeypeer.${INTERFACE}.script"
+            peerpublickey=$(cat "$OUTDIR/publickeypeer.${INTERFACE}.script")
+            peerprivatekey=$(cat "$OUTDIR/privatekeypeer.${INTERFACE}.script")
             echo
             echo "============== Execute the following set of commands ======================================================="
             echo "  ip link add dev $INTERFACE type wireguard     &&    ip addr add dev $INTERFACE ${EDGEIP}/${MASK}"
@@ -313,33 +363,46 @@ else
             echo "       -r $peerprivatekey -l $publickey \\"
             echo "       -i $peerpublicip -e $EDGEIP"
             echo "============================================================================================================"
-        echo " "
-        echo "[Interface]"                                        | tee    "config.peer.$EDGEIP"
-        echo "ListenPort = $LISTENPORT"                           | tee -a "config.peer.$EDGEIP"
-        echo "PrivateKey = $peerprivatekey"                       | tee -a "config.peer.$EDGEIP"
-        echo "Address = $EDGEIP"                                  | tee -a "config.peer.$EDGEIP"
-        echo "DNS = $DNS_SERVER"                                  | tee -a "config.peer.$EDGEIP"
-        echo "MTU = $MTU_VALUE"                                   | tee -a "config.peer.$EDGEIP"
-        echo " "                                                  | tee -a "config.peer.$EDGEIP"
-        echo "[Peer]"                                             | tee -a "config.peer.$EDGEIP"
-        echo "PublicKey = $publickey"                             | tee -a "config.peer.$EDGEIP"
-        echo "PresharedKey = $presharedkey"                       | tee -a "config.peer.$EDGEIP"
-        echo "AllowedIPs = ${EDGEIP}/${MASK},${EXTRA_ALLOWED_IP}" | tee -a "config.peer.$EDGEIP"
-        echo "Endpoint = ${peerpublicip}:${LISTENPORT}"           | tee -a "config.peer.$EDGEIP"
-        echo "PersistentKeepalive = $KEEPALIVE_TIMEOUT"           | tee -a "config.peer.$EDGEIP"
-        echo " "
+            CONFIG_FILE="$OUTDIR/config.peer.$EDGEIP"
+            echo " "
+            echo "[Interface]"                                        | tee    "$CONFIG_FILE"
+            echo "ListenPort = $LISTENPORT"                           | tee -a "$CONFIG_FILE"
+            echo "PrivateKey = $peerprivatekey"                       | tee -a "$CONFIG_FILE"
+            echo "Address = $EDGEIP"                                  | tee -a "$CONFIG_FILE"
+            echo "DNS = $DNS_SERVER"                                  | tee -a "$CONFIG_FILE"
+            echo "MTU = $MTU_VALUE"                                   | tee -a "$CONFIG_FILE"
+            echo " "                                                  | tee -a "$CONFIG_FILE"
+            echo "[Peer]"                                             | tee -a "$CONFIG_FILE"
+            echo "PublicKey = $publickey"                             | tee -a "$CONFIG_FILE"
+            echo "PresharedKey = $presharedkey"                       | tee -a "$CONFIG_FILE"
+            echo "AllowedIPs = ${EDGEIP}/${MASK},${EXTRA_ALLOWED_IP}" | tee -a "$CONFIG_FILE"
+            echo "Endpoint = ${peerpublicip}:${LISTENPORT}"           | tee -a "$CONFIG_FILE"
+            echo "PersistentKeepalive = $KEEPALIVE_TIMEOUT"           | tee -a "$CONFIG_FILE"
+            echo " "
             echo "============================================================================================================"
 
             if checkCommand "qrencode"; then
-                qrencode -r  "config.peer.$EDGEIP" -o  "config.peer.$EDGEIP.png"
+                qrencode -r  "$CONFIG_FILE" -o  "$CONFIG_FILE.png"
             else
                 echo "Install qrencode to produce qrcodes"
             fi
 
-            runCmd sudo wg set $INTERFACE listen-port $LISTENPORT private-key privatekey.${INTERFACE}.script peer $peerpublickey allowed-ips ${EDGEIP}/${MASK},${EXTRA_ALLOWED_IP} preshared-key presharedkey${ii}.${INTERFACE}.script persistent-keepalive $KEEPALIVE_TIMEOUT
+            if [ -z "$DRYRUN" ]; then
+                if ! runCmd sudo wg set "$INTERFACE" listen-port "$LISTENPORT" private-key privatekey."${INTERFACE}".script peer "$peerpublickey" allowed-ips "${EDGEIP}"/${MASK},${EXTRA_ALLOWED_IP} preshared-key presharedkey"${ii}"."${INTERFACE}".script persistent-keepalive "$KEEPALIVE_TIMEOUT"; then
+                    echo "Error: Failed to add peer $ii to WireGuard interface"
+                    exit 1
+                fi
+            fi
         done
     fi
 
-    runCmd sudo ip link set up dev "$INTERFACE"
-    runCmd sudo ip route add "${BASEIP}".0/24 dev "$INTERFACE"
+    if [ -z "$DRYRUN" ]; then
+        if ! runCmd sudo ip link set up dev "$INTERFACE"; then
+            echo "Error: Failed to bring up interface $INTERFACE"
+            exit 1
+        fi
+        if ! runCmd sudo ip route add "${BASEIP}".0/24 dev "$INTERFACE" 2>/dev/null; then
+            echo "Warning: Route ${BASEIP}.0/24 may already exist or failed to add"
+        fi
+    fi
 fi
