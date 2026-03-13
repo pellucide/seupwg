@@ -92,7 +92,7 @@ function usage() {
     echo "$0 clean [-w wireguardinterface] -> Delete the interface"
     echo "$0 create [-s presharedkey] [-w wireguardinterface] [-r privatekey] [-l peerpublickey] [-i publicip] [-e edgeip] [-p port] [-b baseip] -> Create interfaces"
     echo "$0 generate [-i publicip] [-w wireguardinterface] [-c count] [-p port] [-b baseip] [-d dns] [-m mtu] -> Setup local interface and generate 'count' install scripts for peers"
-    echo "$0 regenerate [-w wireguardinterface] [-p port] [-b baseip] [-d dns] [-m mtu] [-i endpoint_ip] -> Recreate config files from existing keys with diff/confirm"
+    echo "$0 regenerate [-w wireguardinterface] [-p port] [-b baseip] [-d dns] [-m mtu] [-i endpoint_ip] [-t hub|peer|all] -> Recreate config files from existing keys with diff/confirm"
     exit 1
 }
 if ! checkCommand "curl"; then
@@ -158,7 +158,8 @@ if [ "$1" == "clean" ]; then
     fi
 elif [ "$1" == "regenerate" ]; then
     shift 1
-    while getopts ":hw:b:p:d:m:i:" o; do
+    REGENERATE_TARGET="all"  # Default: regenerate both hub and peers
+    while getopts ":hw:b:p:d:m:i:t:" o; do
         case "${o}" in
             w) INTERFACE=${OPTARG}
             ;;
@@ -172,6 +173,12 @@ elif [ "$1" == "regenerate" ]; then
             m) MTU_VALUE=${OPTARG}
             ;;
             i) ENDPOINT_IP=${OPTARG}
+            ;;
+            t) REGENERATE_TARGET=${OPTARG}
+               if [[ "$REGENERATE_TARGET" != "hub" && "$REGENERATE_TARGET" != "peer" && "$REGENERATE_TARGET" != "all" ]]; then
+                   echo "Error: -t must be one of: hub, peer, all"
+                   exit 1
+               fi
             ;;
             h) usage
             ;;
@@ -203,11 +210,12 @@ elif [ "$1" == "regenerate" ]; then
     fi
     
     # Find hub public key by MANAGERIP
-    HUB_PUBKEY_FILE="$OUTDIR/${MANAGERIP}.publickey.${INTERFACE}.script"
-    if [ -f "$HUB_PUBKEY_FILE" ]; then
-        HUB_PUBKEY=$(cat "$HUB_PUBKEY_FILE")
+    # Derive hub public key from private key
+    HUB_PRIVKEY_FILE="$OUTDIR/${MANAGERIP}.privatekey.${INTERFACE}.script"
+    if [ -f "$HUB_PRIVKEY_FILE" ]; then
+        HUB_PUBKEY=$(wg pubkey < "$HUB_PRIVKEY_FILE")
     else
-        echo "Error: No hub public key found at $HUB_PUBKEY_FILE"
+        echo "Error: No hub private key found at $HUB_PRIVKEY_FILE"
         exit 1
     fi
     
@@ -243,7 +251,8 @@ elif [ "$1" == "regenerate" ]; then
         fi
     }
     
-    # Find all peer keys and regenerate configs
+    # Find all peer keys and regenerate configs (if target is peer or all)
+    if [[ "$REGENERATE_TARGET" == "peer" || "$REGENERATE_TARGET" == "all" ]]; then
     for peer_privkey in "$OUTDIR"/*.privatekey."${INTERFACE}".script; do
         if [ ! -f "$peer_privkey" ]; then
             continue
@@ -260,18 +269,25 @@ elif [ "$1" == "regenerate" ]; then
             continue
         fi
         
-        # Check if this is a peer (has preshared key)
-        if [ ! -f "$OUTDIR/${peer_ip}.presharedkey.${INTERFACE}.script" ]; then
+        # Check/recover preshared key
+        # Get preshared key from config file
+        CONFIG_FILE="$OUTDIR/config.peer.${peer_ip}"
+        peer_psk=""
+        if [ -f "$CONFIG_FILE" ]; then
+            peer_psk=$(grep "^PresharedKey = " "$CONFIG_FILE" 2>/dev/null | cut -d' ' -f3)
+        fi
+        
+        # Check if this is a peer (has preshared key in config)
+        if [ -z "$peer_psk" ]; then
             continue
         fi
         
         # Skip if this is the hub (doesn't have endpoint set)
         # Hub config is handled separately
         
-        # Get peer's keys
+        # Get peer's private key and derive public key
         peer_privatekey=$(cat "$OUTDIR/${peer_ip}.privatekey.${INTERFACE}.script")
-        peer_pubkey=$(cat "$OUTDIR/${peer_ip}.publickey.${INTERFACE}.script")
-        peer_psk=$(cat "$OUTDIR/${peer_ip}.presharedkey.${INTERFACE}.script")
+        peer_pubkey=$(wg pubkey <<< "$peer_privatekey")
         
         # Get the hub's endpoint from existing config or command line
         endpoint=""
@@ -330,8 +346,10 @@ elif [ "$1" == "regenerate" ]; then
             fi
         fi
     done
+    fi  # End peer regeneration
     
-    # Regenerate hub config - find by MANAGERIP
+    # Regenerate hub config - find by MANAGERIP (if target is hub or all)
+    if [[ "$REGENERATE_TARGET" == "hub" || "$REGENERATE_TARGET" == "all" ]]; then
     HUB_PRIVKEY=""
     HUB_KEY_FILE="$OUTDIR/${MANAGERIP}.privatekey.${INTERFACE}.script"
     if [ -f "$HUB_KEY_FILE" ]; then
@@ -348,19 +366,24 @@ elif [ "$1" == "regenerate" ]; then
         echo "MTU = $MTU_VALUE" >> "$TEMP_HUB"
         echo "" >> "$TEMP_HUB"
         
-        # Add all peers to hub config
-        for peer_pubkey_file in "$OUTDIR"/*.publickey."${INTERFACE}".script; do
-            if [ ! -f "$peer_pubkey_file" ]; then
+        # Add all peers to hub config (derive public keys from private keys)
+        for peer_privkey_file in "$OUTDIR"/*.privatekey."${INTERFACE}".script; do
+            if [ ! -f "$peer_privkey_file" ]; then
                 continue
             fi
-            peer_ip=$(basename "$peer_pubkey_file" | sed -n "s/\(.*\)\.publickey\.${INTERFACE}\.script/\1/p")
+            peer_ip=$(basename "$peer_privkey_file" | sed -n "s/\(.*\)\.privatekey\.${INTERFACE}\.script/\1/p")
             # Skip hub itself
             if [ "$peer_ip" = "$MANAGERIP" ]; then
                 continue
             fi
-            if [ -f "$OUTDIR/${peer_ip}.presharedkey.${INTERFACE}.script" ]; then
-                peer_pubkey=$(cat "$peer_pubkey_file")
-                peer_psk=$(cat "$OUTDIR/${peer_ip}.presharedkey.${INTERFACE}.script")
+            # Get preshared key from peer config
+            peer_config="$OUTDIR/config.peer.${peer_ip}"
+            peer_psk=""
+            if [ -f "$peer_config" ]; then
+                peer_psk=$(grep "^PresharedKey = " "$peer_config" 2>/dev/null | cut -d' ' -f3)
+            fi
+            if [ -n "$peer_psk" ]; then
+                peer_pubkey=$(wg pubkey < "$peer_privkey_file")
                 echo "[Peer]" >> "$TEMP_HUB"
                 echo "PublicKey = $peer_pubkey" >> "$TEMP_HUB"
                 echo "PresharedKey = $peer_psk" >> "$TEMP_HUB"
@@ -373,6 +396,7 @@ elif [ "$1" == "regenerate" ]; then
         HUB_CONFIG="$OUTDIR/config.hub.${MANAGERIP}"
         writeConfigWithConfirm "$HUB_CONFIG" "$TEMP_HUB"
     fi
+    fi  # End hub regeneration
     
     echo "Regeneration complete."
     exit 0
@@ -515,37 +539,21 @@ else
     HUB_KEY_PREFIX="$OUTDIR/${MANAGERIP}"
     
     umask 077
-    # Check if hub keys already exist - if so, use them
+    # Generate or use existing hub private key only
     if [ -f "${HUB_KEY_PREFIX}.privatekey.${INTERFACE}.script" ]; then
         echo "Using existing hub private key: ${HUB_KEY_PREFIX}.privatekey.${INTERFACE}.script"
-        if [ ! -f "${HUB_KEY_PREFIX}.publickey.${INTERFACE}.script" ]; then
-            wg pubkey < "${HUB_KEY_PREFIX}.privatekey.${INTERFACE}.script" > "${HUB_KEY_PREFIX}.publickey.${INTERFACE}.script"
-        fi
     elif [ -z "$privatekeyfromcommandline" ]; then
-        wg genkey | tee "${HUB_KEY_PREFIX}.privatekey.${INTERFACE}.script" | wg pubkey > "${HUB_KEY_PREFIX}.publickey.${INTERFACE}.script"
+        wg genkey > "${HUB_KEY_PREFIX}.privatekey.${INTERFACE}.script"
     else
         echo "$privatekeyfromcommandline" > "${HUB_KEY_PREFIX}.privatekey.${INTERFACE}.script"
-        wg pubkey < "${HUB_KEY_PREFIX}.privatekey.${INTERFACE}.script" > "${HUB_KEY_PREFIX}.publickey.${INTERFACE}.script"
     fi
 
-    if [ -z "$presharedkeyfromcommandline" ]; then
-        if [ -z "$generateFlag" ] && [ -z "$DRYRUN" ]; then
-            echo -n "If you have a preshared-key, enter it here:"
-            read -r preshared
-        fi
-        if [ -z "$preshared" ]; then
-            wg genpsk > "${HUB_KEY_PREFIX}.presharedkey.${INTERFACE}.script"
-        else
-            echo "$preshared" > "${HUB_KEY_PREFIX}.presharedkey.${INTERFACE}.script"
-        fi
-    else
-        echo "$presharedkeyfromcommandline" > "${HUB_KEY_PREFIX}.presharedkey.${INTERFACE}.script"
-    fi
     OUTDIR=$(getOutputDir)
     HUB_KEY_PREFIX="$OUTDIR/${MANAGERIP}"
-    echo "public:$(cat "${HUB_KEY_PREFIX}.publickey.${INTERFACE}.script")"
+    # Derive public key on-the-fly
+    hub_pubkey=$(wg pubkey < "${HUB_KEY_PREFIX}.privatekey.${INTERFACE}.script")
+    echo "public:$hub_pubkey"
     if [ -z "$DRYRUN" ]; then
-        # Hub doesn't have a preshared key with itself
         echo "private:$(cat "${HUB_KEY_PREFIX}.privatekey.${INTERFACE}.script")"
     else
         echo "[DRYRUN] Keys written to $OUTDIR/ directory"
@@ -578,10 +586,22 @@ else
         fi
         peerpublicip=$publicipfromcommandline
 
-        if ! runCmd sudo wg set "$INTERFACE" listen-port "$LISTENPORT" private-key "${HUB_KEY_PREFIX}.privatekey.${INTERFACE}.script" peer "$peerpublickey" allowed-ips "${MANAGERIP}"/${MASK},${EXTRA_ALLOWED_IP} preshared-key "${HUB_KEY_PREFIX}.presharedkey.${INTERFACE}.script" endpoint "$peerpublicip":"$LISTENPORT" persistent-keepalive "$KEEPALIVE_TIMEOUT"; then
+        # For create mode, preshared key must be provided via command line or read interactively
+        if [ -n "$presharedkeyfromcommandline" ]; then
+            PSK_VAL="$presharedkeyfromcommandline"
+        else
+            # Interactive mode - key was read earlier
+            PSK_VAL="${preshared:-$(wg genpsk)}"
+        fi
+        # Write to temp file for wg set
+        PSK_TEMP=$(mktemp)
+        echo "$PSK_VAL" > "$PSK_TEMP"
+        if ! runCmd sudo wg set "$INTERFACE" listen-port "$LISTENPORT" private-key "${HUB_KEY_PREFIX}.privatekey.${INTERFACE}.script" peer "$peerpublickey" allowed-ips "${MANAGERIP}"/${MASK},${EXTRA_ALLOWED_IP} preshared-key "$PSK_TEMP" endpoint "$peerpublicip":"$LISTENPORT" persistent-keepalive "$KEEPALIVE_TIMEOUT"; then
+            rm -f "$PSK_TEMP"
             echo "Error: Failed to configure WireGuard interface"
             exit 1
         fi
+        rm -f "$PSK_TEMP"
     else
         if [ -z "$DRYRUN" ]; then
             runCmd sudo ip addr add dev "$INTERFACE" "${MANAGERIP}"/${MASK}
@@ -593,7 +613,7 @@ else
             echo "Error: Endpoint public IP is required. Use -i option or ensure auto-detection works."
             exit 1
         fi
-        publickey=$(cat "${HUB_KEY_PREFIX}.publickey.${INTERFACE}.script")
+        publickey=$(wg pubkey < "${HUB_KEY_PREFIX}.privatekey.${INTERFACE}.script")
         
         # Find the highest existing peer IP to avoid overwriting
         LAST_IP=1
@@ -632,27 +652,26 @@ else
             # Use IP address in filename
             PEER_KEY_PREFIX="$OUTDIR/${EDGEIP}"
             
-            # Check if this peer's keys already exist
-            if [ -f "${PEER_KEY_PREFIX}.presharedkey.${INTERFACE}.script" ]; then
+            # Check if this peer's private key already exists
+            if [ -f "${PEER_KEY_PREFIX}.privatekey.${INTERFACE}.script" ]; then
                 echo "Peer $EDGEIP keys already exist, skipping..."
                 continue
             fi
             
-            wg genpsk > "${PEER_KEY_PREFIX}.presharedkey.${INTERFACE}.script"
-            presharedkey=$(cat "${PEER_KEY_PREFIX}.presharedkey.${INTERFACE}.script")
+            # Generate keys - only store private key file
             umask 077
-            wg genkey | tee "${PEER_KEY_PREFIX}.privatekey.${INTERFACE}.script" | wg pubkey > "${PEER_KEY_PREFIX}.publickey.${INTERFACE}.script"
-            peerpublickey=$(cat "${PEER_KEY_PREFIX}.publickey.${INTERFACE}.script")
+            wg genkey > "${PEER_KEY_PREFIX}.privatekey.${INTERFACE}.script"
             peerprivatekey=$(cat "${PEER_KEY_PREFIX}.privatekey.${INTERFACE}.script")
+            peerpublickey=$(wg pubkey <<< "$peerprivatekey")
+            presharedkey=$(wg genpsk)
             echo
             echo "============== Execute the following set of commands ======================================================="
             echo "  ip link add dev $INTERFACE type wireguard     &&    ip addr add dev $INTERFACE ${EDGEIP}/${MASK}"
             #echo "  ip addr add dev $INTERFACE ${EDGEIP} peer ${MANAGERIP}"
             echo "  echo '$peerprivatekey' > ${EDGEIP}.privatekey.${INTERFACE}.script"
-            echo "  echo '$presharedkey' > ${EDGEIP}.presharedkey.${INTERFACE}.script"
             echo "  sudo wg set $INTERFACE listen-port $LISTENPORT private-key ${EDGEIP}.privatekey.${INTERFACE}.script \\"
             echo "       peer $publickey allowed-ips ${MANAGERIP}/${MASK},${EXTRA_ALLOWED_IP} \\"
-            echo "       preshared-key ${EDGEIP}.presharedkey.${INTERFACE}.script endpoint $peerpublicip:$LISTENPORT persistent-keepalive $KEEPALIVE_TIMEOUT"
+            echo "       preshared-key <PRESHARED_KEY> endpoint $peerpublicip:$LISTENPORT persistent-keepalive $KEEPALIVE_TIMEOUT"
             echo "  ip link set up dev $INTERFACE"
             echo "============== Or if this script is available, then run the script as below(copy/paste)====================="
             echo "  ./setupwg.sh create -w ${INTERFACE} -b ${BASEIP} -p ${LISTENPORT} -s $presharedkey \\"
@@ -685,10 +704,15 @@ else
             fi
 
             if [ -z "$DRYRUN" ]; then
-                if ! runCmd sudo wg set "$INTERFACE" listen-port "$LISTENPORT" private-key "${HUB_KEY_PREFIX}.privatekey.${INTERFACE}.script" peer "$peerpublickey" allowed-ips "${EDGEIP}"/${MASK},${EXTRA_ALLOWED_IP} preshared-key "${PEER_KEY_PREFIX}.presharedkey.${INTERFACE}.script" persistent-keepalive "$KEEPALIVE_TIMEOUT"; then
+                # Write preshared key to temp file for wg set
+                PSK_TEMP=$(mktemp)
+                echo "$presharedkey" > "$PSK_TEMP"
+                if ! runCmd sudo wg set "$INTERFACE" listen-port "$LISTENPORT" private-key "${HUB_KEY_PREFIX}.privatekey.${INTERFACE}.script" peer "$peerpublickey" allowed-ips "${EDGEIP}"/${MASK},${EXTRA_ALLOWED_IP} preshared-key "$PSK_TEMP" persistent-keepalive "$KEEPALIVE_TIMEOUT"; then
+                    rm -f "$PSK_TEMP"
                     echo "Error: Failed to add peer $EDGEIP to WireGuard interface"
                     exit 1
                 fi
+                rm -f "$PSK_TEMP"
             fi
             
             # Save peer info for hub config
@@ -710,18 +734,22 @@ else
         echo " "                                                  | tee -a "$HUB_CONFIG_FILE"
         
         # Add [Peer] section for ALL peers (existing + new)
-        # Find all peer public key files by IP address pattern
-        for peer_pubkey_file in "$OUTDIR"/*.publickey."${INTERFACE}".script; do
-            if [ -f "$peer_pubkey_file" ]; then
-                # Extract IP from filename (IP.publickey.INTERFACE.script)
-                peer_ip=$(basename "$peer_pubkey_file" | sed -n "s/\(.*\)\.publickey\.${INTERFACE}\.script/\1/p")
+        # Find all peer private key files and derive public keys
+        for peer_privkey_file in "$OUTDIR"/*.privatekey."${INTERFACE}".script; do
+            if [ -f "$peer_privkey_file" ]; then
+                peer_ip=$(basename "$peer_privkey_file" | sed -n "s/\(.*\)\.privatekey\.${INTERFACE}\.script/\1/p")
                 # Skip if this is the hub's IP
                 if [ "$peer_ip" = "$MANAGERIP" ]; then
                     continue
                 fi
-                if [ -n "$peer_ip" ] && [ -f "$OUTDIR/${peer_ip}.presharedkey.${INTERFACE}.script" ]; then
-                    peer_pubkey=$(cat "$OUTDIR/${peer_ip}.publickey.${INTERFACE}.script")
-                    peer_psk=$(cat "$OUTDIR/${peer_ip}.presharedkey.${INTERFACE}.script")
+                # Get preshared key from peer config
+                peer_psk=""
+                peer_config="$OUTDIR/config.peer.${peer_ip}"
+                if [ -f "$peer_config" ]; then
+                    peer_psk=$(grep "^PresharedKey = " "$peer_config" 2>/dev/null | cut -d' ' -f3)
+                fi
+                if [ -n "$peer_ip" ] && [ -n "$peer_psk" ]; then
+                    peer_pubkey=$(wg pubkey < "$peer_privkey_file")
                     echo "[Peer]"                                             | tee -a "$HUB_CONFIG_FILE"
                     echo "PublicKey = $peer_pubkey"                           | tee -a "$HUB_CONFIG_FILE"
                     echo "PresharedKey = $peer_psk"                          | tee -a "$HUB_CONFIG_FILE"
