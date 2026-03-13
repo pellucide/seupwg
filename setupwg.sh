@@ -405,8 +405,12 @@ elif [ "$1" == "regenerate" ]; then
         
         # Add all peers matching BASEIP to hub config
         # For each peer: get private key from peer config, derive public key, get preshared key from peer config
-        for peer_config in "$OUTDIR"/config.peer.*; do
+        for peer_config in "$OUTDIR"/config.peer.*[0-9]; do
             if [ ! -f "$peer_config" ]; then
+                continue
+            fi
+            # Skip PNG files
+            if [[ "$peer_config" == *.png ]]; then
                 continue
             fi
             # Extract IP from filename (config.peer.IP_ADDRESS)
