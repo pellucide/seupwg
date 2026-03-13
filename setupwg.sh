@@ -253,13 +253,13 @@ elif [ "$1" == "regenerate" ]; then
     
     # Find all peer keys and regenerate configs (if target is peer or all)
     if [[ "$REGENERATE_TARGET" == "peer" || "$REGENERATE_TARGET" == "all" ]]; then
-    for peer_privkey in "$OUTDIR"/*.privatekey."${INTERFACE}".script; do
-        if [ ! -f "$peer_privkey" ]; then
+    for peer_privkey_file in "$OUTDIR"/*.privatekey."${INTERFACE}".script; do
+        if [ ! -f "$peer_privkey_file" ]; then
             continue
         fi
         
         # Extract IP from filename
-        peer_ip=$(basename "$peer_privkey" | sed -n "s/\(.*\)\.privatekey\.${INTERFACE}\.script/\1/p")
+        peer_ip=$(basename "$peer_privkey_file" | sed -n "s/\(.*\)\.privatekey\.${INTERFACE}\.script/\1/p")
         if [ -z "$peer_ip" ]; then
             continue
         fi
@@ -274,39 +274,55 @@ elif [ "$1" == "regenerate" ]; then
             continue
         fi
         
-        # Check/recover preshared key
-        # Get preshared key from config file
         CONFIG_FILE="$OUTDIR/config.peer.${peer_ip}"
+        
+        # 1. Get PrivateKey: Config file -> Key file -> Error
+        peer_privatekey=""
+        if [ -f "$CONFIG_FILE" ]; then
+            peer_privatekey=$(grep "^PrivateKey = " "$CONFIG_FILE" 2>/dev/null | cut -d' ' -f3)
+        fi
+        if [ -z "$peer_privatekey" ] && [ -f "$peer_privkey_file" ]; then
+            peer_privatekey=$(cat "$peer_privkey_file")
+        fi
+        if [ -z "$peer_privatekey" ]; then
+            echo "Error: Cannot find PrivateKey for peer $peer_ip in config or key file"
+            exit 1
+        fi
+        
+        # 2. Get PublicKey: Config file -> Derive from private key -> Error
+        peer_pubkey=""
+        if [ -f "$CONFIG_FILE" ]; then
+            peer_pubkey=$(grep "^PublicKey = " "$CONFIG_FILE" 2>/dev/null | cut -d' ' -f3)
+        fi
+        if [ -z "$peer_pubkey" ]; then
+            peer_pubkey=$(wg pubkey <<< "$peer_privatekey")
+        fi
+        if [ -z "$peer_pubkey" ]; then
+            echo "Error: Cannot derive PublicKey for peer $peer_ip"
+            exit 1
+        fi
+        
+        # 3. Get PresharedKey: Config file -> (no key file backup, required in config) -> Error
         peer_psk=""
         if [ -f "$CONFIG_FILE" ]; then
             peer_psk=$(grep "^PresharedKey = " "$CONFIG_FILE" 2>/dev/null | cut -d' ' -f3)
         fi
-        
-        # Check if this is a peer (has preshared key in config)
         if [ -z "$peer_psk" ]; then
-            continue
+            echo "Error: Cannot find PresharedKey for peer $peer_ip in config file"
+            exit 1
         fi
         
-        # Skip if this is the hub (doesn't have endpoint set)
-        # Hub config is handled separately
-        
-        # Get peer's private key and derive public key
-        peer_privatekey=$(cat "$OUTDIR/${peer_ip}.privatekey.${INTERFACE}.script")
-        peer_pubkey=$(wg pubkey <<< "$peer_privatekey")
-        
-        # Get the hub's endpoint from existing config or command line
+        # 4. Get Endpoint: Config file -> Command line -> Error
         endpoint=""
-        if [ -n "$ENDPOINT_IP" ]; then
-            # Use provided endpoint IP
-            endpoint="${ENDPOINT_IP}:${LISTENPORT}"
-        elif [ -f "$OUTDIR/config.peer.$peer_ip" ]; then
-            endpoint=$(grep "^Endpoint = " "$OUTDIR/config.peer.$peer_ip" 2>/dev/null | cut -d' ' -f3)
+        if [ -f "$CONFIG_FILE" ]; then
+            endpoint=$(grep "^Endpoint = " "$CONFIG_FILE" 2>/dev/null | cut -d' ' -f3)
         fi
-        
+        if [ -z "$endpoint" ] && [ -n "$ENDPOINT_IP" ]; then
+            endpoint="${ENDPOINT_IP}:${LISTENPORT}"
+        fi
         if [ -z "$endpoint" ]; then
-            echo "Error: Cannot find Endpoint for peer $peer_ip."
-            echo "The Endpoint (hub's public IP:port) is required to regenerate configs."
-            echo "Use -i <endpoint_ip> to specify the hub's public IP address."
+            echo "Error: Cannot find Endpoint for peer $peer_ip in config file"
+            echo "Use -i <endpoint_ip> to specify the hub's public IP address"
             exit 1
         fi
         
@@ -355,13 +371,29 @@ elif [ "$1" == "regenerate" ]; then
     
     # Regenerate hub config - find by MANAGERIP (if target is hub or all)
     if [[ "$REGENERATE_TARGET" == "hub" || "$REGENERATE_TARGET" == "all" ]]; then
-    HUB_PRIVKEY=""
-    HUB_KEY_FILE="$OUTDIR/${MANAGERIP}.privatekey.${INTERFACE}.script"
-    if [ -f "$HUB_KEY_FILE" ]; then
-        HUB_PRIVKEY=$(cat "$HUB_KEY_FILE")
-    fi
-    
-    if [ -n "$HUB_PRIVKEY" ]; then
+        HUB_CONFIG_FILE="$OUTDIR/config.hub.${MANAGERIP}"
+        HUB_KEY_FILE="$OUTDIR/${MANAGERIP}.privatekey.${INTERFACE}.script"
+        
+        # 1. Get Hub PrivateKey: Config file -> Key file -> Error
+        HUB_PRIVKEY=""
+        if [ -f "$HUB_CONFIG_FILE" ]; then
+            HUB_PRIVKEY=$(grep "^PrivateKey = " "$HUB_CONFIG_FILE" 2>/dev/null | cut -d' ' -f3)
+        fi
+        if [ -z "$HUB_PRIVKEY" ] && [ -f "$HUB_KEY_FILE" ]; then
+            HUB_PRIVKEY=$(cat "$HUB_KEY_FILE")
+        fi
+        if [ -z "$HUB_PRIVKEY" ]; then
+            echo "Error: Cannot find Hub PrivateKey in config file or key file"
+            exit 1
+        fi
+        
+        # 2. Get Hub PublicKey: Derive from private key
+        HUB_PUBKEY=$(wg pubkey <<< "$HUB_PRIVKEY")
+        if [ -z "$HUB_PUBKEY" ]; then
+            echo "Error: Cannot derive Hub PublicKey from private key"
+            exit 1
+        fi
+        
         TEMP_HUB=$(mktemp)
         echo "[Interface]" > "$TEMP_HUB"
         echo "ListenPort = $LISTENPORT" >> "$TEMP_HUB"
@@ -371,40 +403,54 @@ elif [ "$1" == "regenerate" ]; then
         echo "MTU = $MTU_VALUE" >> "$TEMP_HUB"
         echo "" >> "$TEMP_HUB"
         
-        # Add all peers matching BASEIP to hub config (derive public keys from private keys)
-        for peer_privkey_file in "$OUTDIR"/*.privatekey."${INTERFACE}".script; do
-            if [ ! -f "$peer_privkey_file" ]; then
+        # Add all peers matching BASEIP to hub config
+        # For each peer: get private key from peer config, derive public key, get preshared key from peer config
+        for peer_config in "$OUTDIR"/config.peer.*; do
+            if [ ! -f "$peer_config" ]; then
                 continue
             fi
-            peer_ip=$(basename "$peer_privkey_file" | sed -n "s/\(.*\)\.privatekey\.${INTERFACE}\.script/\1/p")
+            # Extract IP from filename (config.peer.IP_ADDRESS)
+            peer_ip=$(basename "$peer_config" | sed 's/config.peer.//')
             # Skip hub itself
             if [ "$peer_ip" = "$MANAGERIP" ]; then
                 continue
             fi
-            # Skip if peer IP doesn't match BASEIP
+            # Skip if peer IP does not match BASEIP
             if [[ ! "$peer_ip" =~ ^${BASEIP}\. ]]; then
                 continue
             fi
-            # Get preshared key from peer config
-            peer_config="$OUTDIR/config.peer.${peer_ip}"
-            peer_psk=""
-            if [ -f "$peer_config" ]; then
-                peer_psk=$(grep "^PresharedKey = " "$peer_config" 2>/dev/null | cut -d' ' -f3)
+            
+            # Get peer's private key from config [Interface] section
+            peer_privatekey=$(grep "^PrivateKey = " "$peer_config" 2>/dev/null | cut -d' ' -f3)
+            if [ -z "$peer_privatekey" ]; then
+                echo "Error: Cannot find PrivateKey for peer $peer_ip in config file"
+                exit 1
             fi
-            if [ -n "$peer_psk" ]; then
-                peer_pubkey=$(wg pubkey < "$peer_privkey_file")
-                echo "[Peer]" >> "$TEMP_HUB"
-                echo "PublicKey = $peer_pubkey" >> "$TEMP_HUB"
-                echo "PresharedKey = $peer_psk" >> "$TEMP_HUB"
-                echo "AllowedIPs = ${peer_ip}/${MASK}" >> "$TEMP_HUB"
-                echo "PersistentKeepalive = $KEEPALIVE_TIMEOUT" >> "$TEMP_HUB"
-                echo "" >> "$TEMP_HUB"
+            
+            # Derive peer's public key from private key
+            peer_pubkey=$(wg pubkey <<< "$peer_privatekey")
+            if [ -z "$peer_pubkey" ]; then
+                echo "Error: Cannot derive PublicKey for peer $peer_ip"
+                exit 1
             fi
+            
+            # Get preshared key from config [Peer] section
+            peer_psk=$(grep "^PresharedKey = " "$peer_config" 2>/dev/null | cut -d' ' -f3)
+            if [ -z "$peer_psk" ]; then
+                echo "Error: Cannot find PresharedKey for peer $peer_ip in config file"
+                exit 1
+            fi
+            
+            echo "[Peer]" >> "$TEMP_HUB"
+            echo "PublicKey = $peer_pubkey" >> "$TEMP_HUB"
+            echo "PresharedKey = $peer_psk" >> "$TEMP_HUB"
+            echo "AllowedIPs = ${peer_ip}/${MASK}" >> "$TEMP_HUB"
+            echo "PersistentKeepalive = $KEEPALIVE_TIMEOUT" >> "$TEMP_HUB"
+            echo "" >> "$TEMP_HUB"
         done
         
         HUB_CONFIG="$OUTDIR/config.hub.${MANAGERIP}"
         writeConfigWithConfirm "$HUB_CONFIG" "$TEMP_HUB"
-    fi
     fi  # End hub regeneration
     
     echo "Regeneration complete."
