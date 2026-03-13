@@ -269,6 +269,11 @@ elif [ "$1" == "regenerate" ]; then
             continue
         fi
         
+        # Skip if peer IP doesn't match BASEIP
+        if [[ ! "$peer_ip" =~ ^${BASEIP}\. ]]; then
+            continue
+        fi
+        
         # Check/recover preshared key
         # Get preshared key from config file
         CONFIG_FILE="$OUTDIR/config.peer.${peer_ip}"
@@ -366,7 +371,7 @@ elif [ "$1" == "regenerate" ]; then
         echo "MTU = $MTU_VALUE" >> "$TEMP_HUB"
         echo "" >> "$TEMP_HUB"
         
-        # Add all peers to hub config (derive public keys from private keys)
+        # Add all peers matching BASEIP to hub config (derive public keys from private keys)
         for peer_privkey_file in "$OUTDIR"/*.privatekey."${INTERFACE}".script; do
             if [ ! -f "$peer_privkey_file" ]; then
                 continue
@@ -374,6 +379,10 @@ elif [ "$1" == "regenerate" ]; then
             peer_ip=$(basename "$peer_privkey_file" | sed -n "s/\(.*\)\.privatekey\.${INTERFACE}\.script/\1/p")
             # Skip hub itself
             if [ "$peer_ip" = "$MANAGERIP" ]; then
+                continue
+            fi
+            # Skip if peer IP doesn't match BASEIP
+            if [[ ! "$peer_ip" =~ ^${BASEIP}\. ]]; then
                 continue
             fi
             # Get preshared key from peer config
