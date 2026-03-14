@@ -793,30 +793,39 @@ else
         echo " "                                                  | tee -a "$HUB_CONFIG_FILE"
         
         # Add [Peer] section for ALL peers (existing + new)
-        # Find all peer private key files and derive public keys
-        for peer_privkey_file in "$OUTDIR"/*.privatekey."${INTERFACE}".script; do
-            if [ -f "$peer_privkey_file" ]; then
-                peer_ip=$(basename "$peer_privkey_file" | sed -n "s/\(.*\)\.privatekey\.${INTERFACE}\.script/\1/p")
-                # Skip if this is the hub's IP
-                if [ "$peer_ip" = "$MANAGERIP" ]; then
-                    continue
-                fi
-                # Get preshared key from peer config
-                peer_psk=""
-                peer_config="$OUTDIR/config.peer.${peer_ip}"
-                if [ -f "$peer_config" ]; then
-                    peer_psk=$(grep "^PresharedKey = " "$peer_config" 2>/dev/null | cut -d' ' -f3)
-                fi
-                if [ -n "$peer_ip" ] && [ -n "$peer_psk" ]; then
-                    peer_pubkey=$(wg pubkey < "$peer_privkey_file")
-                    echo "[Peer]"                                             | tee -a "$HUB_CONFIG_FILE"
-                    echo "PublicKey = $peer_pubkey"                           | tee -a "$HUB_CONFIG_FILE"
-                    echo "PresharedKey = $peer_psk"                          | tee -a "$HUB_CONFIG_FILE"
-                    echo "AllowedIPs = ${peer_ip}/${MASK}"                   | tee -a "$HUB_CONFIG_FILE"
-                    echo "PersistentKeepalive = $KEEPALIVE_TIMEOUT"          | tee -a "$HUB_CONFIG_FILE"
-                    echo " "                                                  | tee -a "$HUB_CONFIG_FILE"
-                fi
+        # Read from peer config files (get private key, derive public key, get preshared key)
+        for peer_config in "$OUTDIR"/config.peer.*[0-9]; do
+            if [ ! -f "$peer_config" ] || [[ "$peer_config" == *.png ]]; then
+                continue
             fi
+            # Extract IP from filename (config.peer.IP_ADDRESS)
+            peer_ip=$(basename "$peer_config" | sed 's/config.peer.//')
+            # Skip if this is the hub's IP
+            if [ "$peer_ip" = "$MANAGERIP" ]; then
+                continue
+            fi
+            
+            # Get peer's private key from config [Interface] section
+            peer_privatekey=$(grep "^PrivateKey = " "$peer_config" 2>/dev/null | cut -d' ' -f3)
+            if [ -z "$peer_privatekey" ]; then
+                continue
+            fi
+            
+            # Derive public key from private key
+            peer_pubkey=$(wg pubkey <<< "$peer_privatekey")
+            
+            # Get preshared key from config [Peer] section
+            peer_psk=$(grep "^PresharedKey = " "$peer_config" 2>/dev/null | cut -d' ' -f3)
+            if [ -z "$peer_psk" ]; then
+                continue
+            fi
+            
+            echo "[Peer]"                                             | tee -a "$HUB_CONFIG_FILE"
+            echo "PublicKey = $peer_pubkey"                           | tee -a "$HUB_CONFIG_FILE"
+            echo "PresharedKey = $peer_psk"                          | tee -a "$HUB_CONFIG_FILE"
+            echo "AllowedIPs = ${peer_ip}/${MASK}"                   | tee -a "$HUB_CONFIG_FILE"
+            echo "PersistentKeepalive = $KEEPALIVE_TIMEOUT"          | tee -a "$HUB_CONFIG_FILE"
+            echo " "                                                  | tee -a "$HUB_CONFIG_FILE"
         done
         echo "Hub configuration written to: $HUB_CONFIG_FILE"
     fi
