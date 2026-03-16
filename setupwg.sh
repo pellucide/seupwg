@@ -87,14 +87,81 @@ function findFreeIP() {
 
 
 function usage() {
-    echo "Usage:"
-    echo "$0 -> this help"
-    echo "$0 clean [-w wireguardinterface] -> Delete the interface"
-    echo "$0 create [-s presharedkey] [-w wireguardinterface] [-r privatekey] [-l peerpublickey] [-i publicip] [-e edgeip] [-p port] [-b baseip] -> Create interfaces"
-    echo "$0 generate [-i publicip] [-w wireguardinterface] [-c count] [-p port] [-b baseip] [-d dns] [-m mtu] -> Setup local interface and generate 'count' install scripts for peers"
-    echo "$0 regenerate [-w wireguardinterface] [-p port] [-b baseip] [-d dns] [-m mtu] [-i endpoint_ip] [-t hub|peer|all] -> Recreate config files from existing keys with diff/confirm"
+    cat <<EOF
+WireGuard VPN Setup Script
+
+Usage: $0 <command> [options]
+
+Commands:
+    generate [-w interface] [-b baseip] [-p port] [-d dns] [-m mtu] [-i publicip]
+        Generate new WireGuard configuration (hub + peers)
+        Default: hub at .1, 2 peers, wg999 interface, 33321 port
+
+    prepare [-w interface] [-b baseip] [-p port] [-d dns] [-m mtu] [-i publicip] [-c count] [-f]
+        Generate config files and keys WITHOUT modifying system
+        Use -f to force overwrite existing files
+        Files created: config.hub.*, config.peer.*, *.privatekey.*.script
+
+    create [-w interface] [-b baseip] [-p port] [-d dns] [-m mtu] [-i publicip]
+        Create new peer configuration for existing WireGuard setup
+        Automatically assigns next available IP address
+
+    regenerate [-w interface] [-t hub|peer|all]
+        Regenerate configuration files from existing files
+        -t: regenerate only hub, only peer, or all configs (default: all)
+        Uses existing key files and config files
+
+    clean [-w interface]
+        Remove WireGuard interface and all configuration files
+        Removes /etc/wireguard/{interface}* and down the interface
+
+    help
+        Show this help message
+
+Options:
+    -w <interface>  WireGuard interface name (default: wg999)
+    -b <baseip>     Base IP address (default: 192.168.88)
+    -p <port>       Listen port (default: 33321)
+    -d <dns>        DNS server (default: 1.1.1.1)
+    -m <mtu>        MTU value (default: 1350)
+    -i <ip>         Public IP address (auto-detected if not specified)
+    -c <count>      Number of peers to generate (default: 1 for prepare, 2 for generate)
+    -f              Force overwrite existing files (prepare mode only)
+    -t <target>     Target for regenerate: hub|peer|all (default: all)
+
+Environment Variables:
+    DRYRUN=1        Show commands without executing
+    VERBOSE=1       Show detailed output
+
+Examples:
+    # Generate hub + 2 peers with defaults
+    $0 generate
+
+    # Generate hub + 5 peers on custom network
+    $0 generate -c 5 -b 10.10.9
+
+    # Prepare files for wg999 (no system changes)
+    $0 prepare -w wg999 -c 3
+
+    # Force overwrite existing files
+    $0 prepare -w wg999 -c 3 -f
+
+    # Create additional peer for existing setup
+    $0 create -w wg999
+
+    # Regenerate all configs from existing keys
+    $0 regenerate -w wg999
+
+    # Regenerate only hub config
+    $0 regenerate -w wg999 -t hub
+
+    # Clean up everything
+    $0 clean -w wg999
+
+EOF
     exit 1
 }
+
 if ! checkCommand "curl"; then
     echo "The command curl not found. Please install curl"
     usage
@@ -156,6 +223,240 @@ if [ "$1" == "clean" ]; then
         rm -rf "$DRYRUN_DIR"
         runCmd sudo ip link delete dev "$INTERFACE"
     fi
+elif [ "$1" == "prepare" ]; then
+    shift 1
+    PREPARE_COUNT=1
+    FORCE_OVERWRITE=0
+    while getopts ":hw:c:b:p:d:m:i:f" o; do
+        case "${o}" in
+            w) INTERFACE=${OPTARG}
+            ;;
+            c) PREPARE_COUNT=${OPTARG}
+            ;;
+            b) BASEIP=${OPTARG}
+               MANAGERIP=${BASEIP}.1
+            ;;
+            p) LISTENPORT=${OPTARG}
+            ;;
+            d) DNS_SERVER=${OPTARG}
+            ;;
+            m) MTU_VALUE=${OPTARG}
+            ;;
+            i) publicipfromcommandline=${OPTARG}
+            ;;
+            f) FORCE_OVERWRITE=1
+            ;;
+            h) usage
+            ;;
+            :) echo "Error: Option -${OPTARG} requires an argument"
+               usage
+               exit 1
+            ;;
+            ?) echo "Error: Invalid option: -${OPTARG}"
+               usage
+               exit 1
+            ;;
+            *) echo "Error: Unknown option"
+               usage
+               exit 1
+            ;;
+        esac
+    done
+    shift $((OPTIND-1))
+    if [ $# -ne 0 ]; then
+        echo "Error: Unexpected arguments: $*"
+        usage
+        exit 1
+    fi
+    
+    # Validate count
+    if ! [[ "$PREPARE_COUNT" =~ ^[0-9]+$ ]]; then
+        echo "Error: Invalid count: $PREPARE_COUNT (must be a number)"
+        exit 1
+    fi
+    if [ "$PREPARE_COUNT" -lt 1 ]; then 
+        PREPARE_COUNT=1
+    fi
+    if [ "$PREPARE_COUNT" -gt 10 ]; then 
+        PREPARE_COUNT=10
+    fi
+    
+    # Get public IP if not provided
+    if [ -z "$publicipfromcommandline" ]; then
+        publicipfromcommandline=$(getPublicIp)
+        if [ -z "$publicipfromcommandline" ]; then
+            echo "Error: Cannot auto-detect public IP. Use -i option to specify."
+            exit 1
+        fi
+    fi
+    
+    OUTDIR=$(getOutputDir)
+    ensureDryRunDir
+    
+    # Function to write config with diff/confirm
+    function writeConfigWithConfirmOrForce() {
+        local config_file="$1"
+        local temp_file="$2"
+        local force="$3"
+        
+        if [ -f "$config_file" ] && [ "$force" -eq 0 ]; then
+            echo ""
+            echo "Config file $config_file already exists."
+            echo "--- Diff (old -> new) ---"
+            diff -u "$config_file" "$temp_file" || true
+            echo "-------------------------"
+            echo -n "Overwrite? [y/N]: "
+            read -r response
+            if [[ "$response" == "y" || "$response" == "Y" ]]; then
+                mv "$temp_file" "$config_file"
+                echo "Overwritten: $config_file"
+                return 0
+            else
+                rm "$temp_file"
+                echo "Skipped: $config_file"
+                return 1
+            fi
+        else
+            mv "$temp_file" "$config_file"
+            if [ "$force" -eq 1 ] && [ -f "$config_file" ]; then
+                echo "Force overwritten: $config_file"
+            else
+                echo "Created: $config_file"
+            fi
+            return 0
+        fi
+    }
+    
+    # Generate hub keys
+    HUB_KEY_PREFIX="$OUTDIR/${MANAGERIP}"
+    umask 077
+    if [ ! -f "${HUB_KEY_PREFIX}.privatekey.${INTERFACE}.script" ]; then
+        wg genkey > "${HUB_KEY_PREFIX}.privatekey.${INTERFACE}.script"
+        echo "Generated hub private key: ${HUB_KEY_PREFIX}.privatekey.${INTERFACE}.script"
+    else
+        echo "Using existing hub private key"
+    fi
+    hub_pubkey=$(wg pubkey < "${HUB_KEY_PREFIX}.privatekey.${INTERFACE}.script")
+    
+    # Generate peer configs and keys
+    LAST_IP=1
+    for existing_peer in "$OUTDIR"/*.privatekey."${INTERFACE}".script; do
+        if [ -f "$existing_peer" ]; then
+            peer_ip=$(basename "$existing_peer" | sed -n "s/\(.*\)\.privatekey\.${INTERFACE}\.script/\1/p")
+            if [ "$peer_ip" = "$MANAGERIP" ]; then
+                continue
+            fi
+            if [ -n "$peer_ip" ]; then
+                peer_last_octet=$(echo "$peer_ip" | cut -d'.' -f4)
+                if [ -n "$peer_last_octet" ] && [ "$peer_last_octet" -gt "$LAST_IP" ]; then
+                    LAST_IP=$peer_last_octet
+                fi
+            fi
+        fi
+    done
+    
+    for ii in $(seq 1 $PREPARE_COUNT); do
+        LAST_IP=$((LAST_IP + 1))
+        EDGEIP="${BASEIP}.${LAST_IP}"
+        
+        PEER_KEY_PREFIX="$OUTDIR/${EDGEIP}"
+        
+        # Check if peer already exists
+        if [ -f "${PEER_KEY_PREFIX}.privatekey.${INTERFACE}.script" ] && [ "$FORCE_OVERWRITE" -eq 0 ]; then
+            echo "Peer $EDGEIP already exists, skipping..."
+            continue
+        fi
+        
+        # Generate peer keys
+        wg genkey > "${PEER_KEY_PREFIX}.privatekey.${INTERFACE}.script"
+        peerprivatekey=$(cat "${PEER_KEY_PREFIX}.privatekey.${INTERFACE}.script")
+        peerpublickey=$(wg pubkey <<< "$peerprivatekey")
+        presharedkey=$(wg genpsk)
+        
+        # Generate peer config
+        TEMP_CONFIG=$(mktemp)
+        echo "[Interface]" > "$TEMP_CONFIG"
+        echo "ListenPort = $LISTENPORT" >> "$TEMP_CONFIG"
+        echo "PrivateKey = $peerprivatekey" >> "$TEMP_CONFIG"
+        echo "Address = $EDGEIP" >> "$TEMP_CONFIG"
+        echo "DNS = $DNS_SERVER" >> "$TEMP_CONFIG"
+        echo "MTU = $MTU_VALUE" >> "$TEMP_CONFIG"
+        echo "" >> "$TEMP_CONFIG"
+        echo "[Peer]" >> "$TEMP_CONFIG"
+        echo "PublicKey = $hub_pubkey" >> "$TEMP_CONFIG"
+        echo "PresharedKey = $presharedkey" >> "$TEMP_CONFIG"
+        echo "AllowedIPs = ${MANAGERIP}/${MASK},${EXTRA_ALLOWED_IP}" >> "$TEMP_CONFIG"
+        echo "Endpoint = ${publicipfromcommandline}:${LISTENPORT}" >> "$TEMP_CONFIG"
+        echo "PersistentKeepalive = $KEEPALIVE_TIMEOUT" >> "$TEMP_CONFIG"
+        
+        CONFIG_FILE="$OUTDIR/config.peer.${EDGEIP}"
+        if writeConfigWithConfirmOrForce "$CONFIG_FILE" "$TEMP_CONFIG" "$FORCE_OVERWRITE"; then
+            # Generate QR code if available
+            if checkCommand "qrencode"; then
+                QR_FILE="$CONFIG_FILE.png"
+                if [ $FORCE_OVERWRITE -eq 1 ] || [ ! -f "$QR_FILE" ]; then
+                    qrencode -r "$CONFIG_FILE" -o "$QR_FILE"
+                    echo "QR code: $QR_FILE"
+                fi
+            fi
+        fi
+    done
+    
+    # Generate hub config
+    TEMP_HUB=$(mktemp)
+    echo "[Interface]" > "$TEMP_HUB"
+    echo "ListenPort = $LISTENPORT" >> "$TEMP_HUB"
+    echo "PrivateKey = $(cat "${HUB_KEY_PREFIX}.privatekey.${INTERFACE}.script")" >> "$TEMP_HUB"
+    echo "Address = ${MANAGERIP}/${MASK}" >> "$TEMP_HUB"
+    echo "DNS = $DNS_SERVER" >> "$TEMP_HUB"
+    echo "MTU = $MTU_VALUE" >> "$TEMP_HUB"
+    echo "" >> "$TEMP_HUB"
+    
+    # Add all peers to hub config
+    for peer_config in "$OUTDIR"/config.peer.*[0-9]; do
+        if [ ! -f "$peer_config" ] || [[ "$peer_config" == *.png ]]; then
+            continue
+        fi
+        peer_ip=$(basename "$peer_config" | sed 's/config.peer.//')
+        if [ "$peer_ip" = "$MANAGERIP" ]; then
+            continue
+        fi
+        
+        peer_privatekey=$(grep "^PrivateKey = " "$peer_config" 2>/dev/null | cut -d' ' -f3)
+        if [ -z "$peer_privatekey" ]; then
+            continue
+        fi
+        
+        peer_pubkey=$(wg pubkey <<< "$peer_privatekey")
+        peer_psk=$(grep "^PresharedKey = " "$peer_config" 2>/dev/null | cut -d' ' -f3)
+        if [ -z "$peer_psk" ]; then
+            continue
+        fi
+        
+        echo "[Peer]" >> "$TEMP_HUB"
+        echo "PublicKey = $peer_pubkey" >> "$TEMP_HUB"
+        echo "PresharedKey = $peer_psk" >> "$TEMP_HUB"
+        echo "AllowedIPs = ${peer_ip}/${MASK}" >> "$TEMP_HUB"
+        echo "PersistentKeepalive = $KEEPALIVE_TIMEOUT" >> "$TEMP_HUB"
+        echo "" >> "$TEMP_HUB"
+    done
+    
+    HUB_CONFIG_FILE="$OUTDIR/config.hub.${MANAGERIP}"
+    writeConfigWithConfirmOrForce "$HUB_CONFIG_FILE" "$TEMP_HUB" "$FORCE_OVERWRITE"
+    
+    echo ""
+    echo "=========================================="
+    echo "Prepared files for interface: $INTERFACE"
+    echo "=========================================="
+    echo "Hub config: $HUB_CONFIG_FILE"
+    echo "Peer configs: $OUTDIR/config.peer.*"
+    echo ""
+    echo "To use with wg-quick:"
+    echo "  sudo wg-quick up ./config.hub.${MANAGERIP}"
+    echo "  sudo wg-quick down ./config.hub.${MANAGERIP}"
+    echo "=========================================="
+    exit 0
+
 elif [ "$1" == "regenerate" ]; then
     shift 1
     REGENERATE_TARGET="all"  # Default: regenerate both hub and peers
