@@ -31,7 +31,7 @@ function runCmd() {
 
 function getOutputDir() {
     if [ -z "$DRYRUN" ]; then
-        echo "."
+        echo "./${INTERFACE}"
     else
         echo "$DRYRUN_DIR"
     fi
@@ -40,6 +40,14 @@ function getOutputDir() {
 function ensureDryRunDir() {
     if [ ! -z "$DRYRUN" ] && [ ! -d "$DRYRUN_DIR" ]; then
         mkdir -p "$DRYRUN_DIR"
+    fi
+}
+
+function ensureOutputDir() {
+    local outdir
+    outdir=$(getOutputDir)
+    if [ ! -d "$outdir" ]; then
+        mkdir -p "$outdir"
     fi
 }
 
@@ -291,7 +299,7 @@ elif [ "$1" == "prepare" ]; then
     fi
     
     OUTDIR=$(getOutputDir)
-    ensureDryRunDir
+    ensureOutputDir
     
     # Function to write config with diff/confirm
     function writeConfigWithConfirmOrForce() {
