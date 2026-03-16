@@ -119,6 +119,11 @@ Commands:
         -t: regenerate only hub, only peer, or all configs (default: all)
         Uses existing key files and config files
 
+    verify [-w interface] [-b baseip]
+        Verify generated configuration files for consistency
+        Checks key files, configs, AllowedIPs, PSKs, cross-references
+        Returns exit code 0 if valid, non-zero if errors found
+
     clean [-w interface]
         Remove WireGuard interface and all configuration files
         Removes /etc/wireguard/{interface}* and down the interface
@@ -162,6 +167,9 @@ Examples:
 
     # Regenerate only hub config
     $0 regenerate -w wg999 -t hub
+
+    # Verify generated configuration
+    $0 verify -w wg999
 
     # Clean up everything
     $0 clean -w wg999
@@ -462,6 +470,324 @@ elif [ "$1" == "prepare" ]; then
     echo "To use with wg-quick:"
     echo "  sudo wg-quick up ./config.hub.${MANAGERIP}"
     echo "  sudo wg-quick down ./config.hub.${MANAGERIP}"
+    echo "=========================================="
+    exit 0
+
+elif [ "$1" == "verify" ]; then
+    shift 1
+    while getopts ":hw:b:" o; do
+        case "${o}" in
+            w) INTERFACE=${OPTARG}
+            ;;
+            b) BASEIP=${OPTARG}
+               MANAGERIP=${BASEIP}.1
+            ;;
+            h) usage
+            ;;
+            :) echo "Error: Option -${OPTARG} requires an argument"
+               usage
+               exit 1
+            ;;
+            ?) echo "Error: Invalid option: -${OPTARG}"
+               usage
+               exit 1
+            ;;
+            *) echo "Error: Unknown option"
+               usage
+               exit 1
+            ;;
+        esac
+    done
+    shift $((OPTIND-1))
+    if [ $# -ne 0 ]; then
+        echo "Error: Unexpected arguments: $*"
+        usage
+        exit 1
+    fi
+    
+    OUTDIR=$(getOutputDir)
+    
+    # Colors for output
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[1;33m'
+    NC='\033[0m' # No Color
+    
+    ERRORS=0
+    WARNINGS=0
+    
+    function print_ok() {
+        echo -e "${GREEN}[OK]${NC} $1"
+    }
+    
+    function print_error() {
+        echo -e "${RED}[ERROR]${NC} $1"
+        ((ERRORS++))
+    }
+    
+    function print_warning() {
+        echo -e "${YELLOW}[WARNING]${NC} $1"
+        ((WARNINGS++))
+    }
+    
+    function print_info() {
+        echo "[INFO] $1"
+    }
+    
+    echo "=========================================="
+    echo "Verifying WireGuard configuration: $INTERFACE"
+    echo "Directory: $OUTDIR"
+    echo "=========================================="
+    echo ""
+    
+    # Check directory exists
+    if [ ! -d "$OUTDIR" ]; then
+        print_error "Directory $OUTDIR does not exist"
+        exit 1
+    fi
+    print_ok "Directory exists: $OUTDIR"
+    
+    # Check hub private key file
+    HUB_KEY_FILE="$OUTDIR/${MANAGERIP}.privatekey.${INTERFACE}.script"
+    if [ ! -f "$HUB_KEY_FILE" ]; then
+        print_error "Hub private key file not found: $HUB_KEY_FILE"
+    else
+        print_ok "Hub private key file exists"
+        HUB_PRIVKEY=$(cat "$HUB_KEY_FILE" 2>/dev/null)
+        if [ -z "$HUB_PRIVKEY" ]; then
+            print_error "Hub private key file is empty"
+        else
+            # Validate key format (base64, ~44 chars)
+            if ! echo "$HUB_PRIVKEY" | grep -qE '^[A-Za-z0-9+/]{43}=$'; then
+                print_warning "Hub private key format looks invalid"
+            else
+                print_ok "Hub private key format is valid"
+            fi
+            # Derive public key
+            HUB_PUBKEY=$(wg pubkey <<< "$HUB_PRIVKEY" 2>/dev/null)
+            if [ -z "$HUB_PUBKEY" ]; then
+                print_error "Failed to derive hub public key from private key"
+            else
+                print_ok "Hub public key derived: ${HUB_PUBKEY:0:20}..."
+            fi
+        fi
+    fi
+    
+    # Check hub config
+    HUB_CONFIG="$OUTDIR/config.hub.${MANAGERIP}"
+    if [ ! -f "$HUB_CONFIG" ]; then
+        print_error "Hub config file not found: $HUB_CONFIG"
+    else
+        print_ok "Hub config file exists"
+        
+        # Parse hub config
+        HUB_CFG_PRIVKEY=$(grep "^PrivateKey = " "$HUB_CONFIG" 2>/dev/null | cut -d' ' -f3)
+        HUB_CFG_LISTENPORT=$(grep "^ListenPort = " "$HUB_CONFIG" 2>/dev/null | cut -d' ' -f3)
+        HUB_CFG_ADDRESS=$(grep "^Address = " "$HUB_CONFIG" 2>/dev/null | cut -d' ' -f3)
+        
+        if [ -z "$HUB_CFG_PRIVKEY" ]; then
+            print_error "Hub config missing PrivateKey"
+        else
+            if [ "$HUB_CFG_PRIVKEY" != "$HUB_PRIVKEY" ]; then
+                print_error "Hub config PrivateKey does not match key file"
+            else
+                print_ok "Hub config PrivateKey matches key file"
+            fi
+        fi
+        
+        if [ -z "$HUB_CFG_LISTENPORT" ]; then
+            print_warning "Hub config missing ListenPort"
+        else
+            print_ok "Hub ListenPort: $HUB_CFG_LISTENPORT"
+        fi
+        
+        if [ -z "$HUB_CFG_ADDRESS" ]; then
+            print_error "Hub config missing Address"
+        else
+            print_ok "Hub Address: $HUB_CFG_ADDRESS"
+            # Check if address matches expected format
+            if [[ "$HUB_CFG_ADDRESS" != "${MANAGERIP}/"* ]]; then
+                print_warning "Hub Address $HUB_CFG_ADDRESS does not match expected base $MANAGERIP"
+            fi
+        fi
+        
+        # Count peers in hub config
+        HUB_PEER_COUNT=$(grep -c "^\\[Peer\\]$" "$HUB_CONFIG" 2>/dev/null || echo 0)
+        print_info "Hub config has $HUB_PEER_COUNT peer(s)"
+    fi
+    
+    # Check peer configs
+    PEER_COUNT=0
+    declare -A PEER_PUBKEYS
+    declare -A PEER_PSKS
+    
+    for peer_config in "$OUTDIR"/config.peer.*[0-9]; do
+        if [ ! -f "$peer_config" ] || [[ "$peer_config" == *.png ]]; then
+            continue
+        fi
+        
+        PEER_COUNT=$((PEER_COUNT + 1))
+        PEER_IP=$(basename "$peer_config" | sed 's/config.peer.//')
+        print_info "Checking peer: $PEER_IP"
+        
+        # Parse peer config
+        PEER_PRIVKEY=$(grep "^PrivateKey = " "$peer_config" 2>/dev/null | cut -d' ' -f3)
+        PEER_PUBKEY=$(grep "^PublicKey = " "$peer_config" 2>/dev/null | cut -d' ' -f3)
+        PEER_PSK=$(grep "^PresharedKey = " "$peer_config" 2>/dev/null | cut -d' ' -f3)
+        PEER_ENDPOINT=$(grep "^Endpoint = " "$peer_config" 2>/dev/null | cut -d' ' -f3)
+        PEER_ALLOWED=$(grep "^AllowedIPs = " "$peer_config" 2>/dev/null | cut -d' ' -f3-)
+        PEER_ADDRESS=$(grep "^Address = " "$peer_config" 2>/dev/null | cut -d' ' -f3)
+        
+        if [ -z "$PEER_PRIVKEY" ]; then
+            print_error "  Peer $PEER_IP: missing PrivateKey"
+        else
+            # Check private key file exists
+            PEER_KEY_FILE="$OUTDIR/${PEER_IP}.privatekey.${INTERFACE}.script"
+            if [ ! -f "$PEER_KEY_FILE" ]; then
+                print_warning "  Peer $PEER_IP: private key file not found: $PEER_KEY_FILE"
+            else
+                FILE_PRIVKEY=$(cat "$PEER_KEY_FILE" 2>/dev/null)
+                if [ "$FILE_PRIVKEY" != "$PEER_PRIVKEY" ]; then
+                    print_error "  Peer $PEER_IP: config PrivateKey does not match key file"
+                else
+                    print_ok "  Peer $PEER_IP: private key matches file"
+                fi
+            fi
+            
+            # Derive public key
+            DERIVED_PUBKEY=$(wg pubkey <<< "$PEER_PRIVKEY" 2>/dev/null)
+            if [ -z "$DERIVED_PUBKEY" ]; then
+                print_error "  Peer $PEER_IP: failed to derive public key"
+            else
+                PEER_PUBKEYS["$PEER_IP"]="$DERIVED_PUBKEY"
+                print_ok "  Peer $PEER_IP: derived public key ${DERIVED_PUBKEY:0:20}..."
+            fi
+        fi
+        
+        if [ -z "$PEER_PUBKEY" ]; then
+            print_error "  Peer $PEER_IP: missing PublicKey (hub's public key)"
+        else
+            # Check if peer's PublicKey matches hub's derived public key
+            if [ -n "$HUB_PUBKEY" ] && [ "$PEER_PUBKEY" != "$HUB_PUBKEY" ]; then
+                print_error "  Peer $PEER_IP: [Peer] PublicKey does not match hub's public key"
+                print_info "    Expected: $HUB_PUBKEY"
+                print_info "    Got:      $PEER_PUBKEY"
+            else
+                print_ok "  Peer $PEER_IP: [Peer] PublicKey matches hub"
+            fi
+        fi
+        
+        if [ -z "$PEER_PSK" ]; then
+            print_warning "  Peer $PEER_IP: missing PresharedKey"
+        else
+            PEER_PSKS["$PEER_IP"]="$PEER_PSK"
+            print_ok "  Peer $PEER_IP: has PresharedKey"
+        fi
+        
+        if [ -z "$PEER_ENDPOINT" ]; then
+            print_warning "  Peer $PEER_IP: missing Endpoint"
+        else
+            print_ok "  Peer $PEER_IP: Endpoint = $PEER_ENDPOINT"
+        fi
+        
+        if [ -z "$PEER_ALLOWED" ]; then
+            print_warning "  Peer $PEER_IP: missing AllowedIPs"
+        else
+            # Check if AllowedIPs includes hub IP
+            if [[ "$PEER_ALLOWED" == *"${MANAGERIP}/"* ]] || [[ "$PEER_ALLOWED" == *"${MANAGERIP},"* ]]; then
+                print_ok "  Peer $PEER_IP: AllowedIPs includes hub IP"
+            else
+                print_warning "  Peer $PEER_IP: AllowedIPs may not include hub IP: $PEER_ALLOWED"
+            fi
+        fi
+        
+        if [ -z "$PEER_ADDRESS" ]; then
+            print_error "  Peer $PEER_IP: missing Address"
+        else
+            if [ "$PEER_ADDRESS" != "$PEER_IP" ]; then
+                print_error "  Peer $PEER_IP: Address $PEER_ADDRESS does not match filename"
+            else
+                print_ok "  Peer $PEER_IP: Address matches filename"
+            fi
+        fi
+        echo ""
+    done
+    
+    # Cross-validate hub config peers
+    if [ -f "$HUB_CONFIG" ] && [ ${#PEER_PUBKEYS[@]} -gt 0 ]; then
+        print_info "Cross-validating hub config with peer configs..."
+        
+        # Parse hub config into associative arrays by public key
+        declare -A HUB_PEER_PSK
+        declare -A HUB_PEER_ALLOWED
+        
+        current_pubkey=""
+        while IFS= read -r line; do
+            # Start of new peer section
+            if [[ "$line" == "[Peer]" ]]; then
+                current_pubkey=""
+            fi
+            # Extract PublicKey
+            if [[ "$line" == "PublicKey = "* ]]; then
+                current_pubkey="${line#PublicKey = }"
+            fi
+            # Extract PresharedKey (belongs to current peer)
+            if [[ "$line" == "PresharedKey = "* ]] && [ -n "$current_pubkey" ]; then
+                HUB_PEER_PSK["$current_pubkey"]="${line#PresharedKey = }"
+            fi
+            # Extract AllowedIPs (belongs to current peer)
+            if [[ "$line" == "AllowedIPs = "* ]] && [ -n "$current_pubkey" ]; then
+                HUB_PEER_ALLOWED["$current_pubkey"]="${line#AllowedIPs = }"
+            fi
+        done < "$HUB_CONFIG"
+        
+        for peer_ip in "${!PEER_PUBKEYS[@]}"; do
+            peer_pubkey="${PEER_PUBKEYS[$peer_ip]}"
+            peer_psk="${PEER_PSKS[$peer_ip]:-}"
+            
+            # Check if this peer exists in hub config
+            if [ -n "${HUB_PEER_ALLOWED[$peer_pubkey]}" ]; then
+                print_ok "Peer $peer_ip public key found in hub config"
+                
+                # Check preshared key matches
+                if [ -n "$peer_psk" ]; then
+                    hub_psk="${HUB_PEER_PSK[$peer_pubkey]:-}"
+                    if [ "$hub_psk" == "$peer_psk" ]; then
+                        print_ok "Peer $peer_ip PresharedKey matches in hub config"
+                    else
+                        print_error "Peer $peer_ip PresharedKey mismatch between peer and hub config"
+                        print_info "  Peer PSK: ${peer_psk:0:20}..."
+                        print_info "  Hub PSK:  ${hub_psk:0:20}..."
+                    fi
+                fi
+                
+                # Check AllowedIPs
+                hub_allowed="${HUB_PEER_ALLOWED[$peer_pubkey]}"
+                expected_allowed="${peer_ip}/${MASK}"
+                if [ "$hub_allowed" == "$expected_allowed" ]; then
+                    print_ok "Peer $peer_ip AllowedIPs correct in hub config: $hub_allowed"
+                else
+                    print_error "Peer $peer_ip AllowedIPs mismatch: expected $expected_allowed, got $hub_allowed"
+                fi
+            else
+                print_error "Peer $peer_ip public key NOT found in hub config"
+            fi
+        done
+    fi
+    
+    # Summary
+    echo ""
+    echo "=========================================="
+    if [ $ERRORS -eq 0 ] && [ $WARNINGS -eq 0 ]; then
+        echo -e "${GREEN}Verification PASSED${NC} - All checks passed"
+        exit 0
+    elif [ $ERRORS -eq 0 ]; then
+        echo -e "${YELLOW}Verification PASSED with warnings${NC} - $WARNINGS warning(s)"
+        exit 0
+    else
+        echo -e "${RED}Verification FAILED${NC} - $ERRORS error(s), $WARNINGS warning(s)"
+        exit 1
+    fi
     echo "=========================================="
     exit 0
 
@@ -884,7 +1210,7 @@ else
     fi
 
 
-    if interfaceStatus; then
+    if [ -z "$DRYRUN" ] && interfaceStatus; then
         echo
         echo "Interface $INTERFACE exists. This script will use exiting settings !!!"
         privatekeyfromcommandline=$(getCurrentWireguardSetting "private-key")
@@ -900,8 +1226,8 @@ else
         echo "LISTENPORT = $LISTENPORT"
     fi
 
-    ensureDryRunDir
     OUTDIR=$(getOutputDir)
+    ensureOutputDir
     
     # Hub key files use the hub's IP (MANAGERIP)
     HUB_KEY_PREFIX="$OUTDIR/${MANAGERIP}"
