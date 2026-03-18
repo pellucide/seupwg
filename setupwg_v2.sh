@@ -56,6 +56,20 @@ getCurrentBaseIP() {
 
 findFreeIP() {
     local current_base current_last
+    # In DRYRUN mode, find highest IP from existing key files
+    if [[ -n "$DRYRUN" ]]; then
+        local outdir="$(getOutputDir)"
+        current_last=1
+        local keyfile
+        for keyfile in "$outdir"/*.privatekey."${INTERFACE}".script; do
+            [[ -f "$keyfile" ]] || continue
+            local ip=$(basename "$keyfile" | sed -n "s/.*\.\([0-9]*\)\.privatekey.*/\1/p")
+            [[ -n "$ip" && "$ip" =~ ^[0-9]+$ ]] && ((ip > current_last)) && current_last=$ip
+        done
+        echo "${BASEIP}.$((current_last + 1))"
+        return
+    fi
+    
     current_base=$(getCurrentBaseIP)
     [[ "$current_base" ]] && BASEIP="$current_base"
     current_last=$(sudo wg show "$INTERFACE" allowed-ips 2>/dev/null | cut -f2 | cut -d'.' -f4 | cut -d'/' -f1 | sort -n | tail -1)
@@ -202,8 +216,11 @@ Commands:
     prepare [-w interface] [-b baseip] [-p port] [-d dns] [-m mtu] [-i ip] [-c count] [-f]
         Generate config files and keys WITHOUT modifying system
     
-    create [-w interface] [-b baseip] [-p port] [-d dns] [-m mtu] [-i ip]
-        Create new peer for existing WireGuard setup
+    generate [-w interface] [-b baseip] [-p port] [-d dns] [-m mtu] [-i ip] [-c count] [-f]
+        Generate new WireGuard setup (hub + peers, configures system)
+    
+    create [-w interface] [-b baseip] [-p port] [-d dns] [-m mtu] [-i ip] [-s psk] [-r privkey] [-l pubkey] [-e ip]
+        Create new peer for existing WireGuard setup (adds to system interface)
     
     recreate [-w interface] [-t hub|peer|all] [-f]
         Recreate configs from existing keys (use -i to update endpoint, -f to force)
@@ -434,6 +451,245 @@ cmd_recreate() {
     echo "=========================================="
 }
 
+cmd_generate() {
+    # Reset defaults for this command
+    BASEIP="192.168.88"
+    MANAGERIP="${BASEIP}.1"
+    local count=1 public_ip=""
+    
+    while getopts ":hw:c:b:p:d:m:i:f" o; do
+        case "${o}" in
+            w) INTERFACE="$OPTARG" ;;
+            c) count="$OPTARG" ;;
+            b) BASEIP="$OPTARG"; MANAGERIP="${BASEIP}.1" ;;
+            p) LISTENPORT="$OPTARG" ;;
+            d) DNS_SERVER="$OPTARG" ;;
+            m) MTU_VALUE="$OPTARG" ;;
+            i) public_ip="$OPTARG" ;;
+            f) FORCE_OVERWRITE=1 ;;
+            h) usage ;;
+            :) die "Option -$OPTARG requires an argument" ;;
+            ?) die "Invalid option: -$OPTARG" ;;
+        esac
+    done
+    
+    # Validate count
+    [[ "$count" =~ ^[0-9]+$ ]] || die "Invalid count: $count"
+    ((count < 0)) && count=1
+    ((count > 10)) && count=10
+    
+    # Get public IP
+    if [[ -z "$public_ip" ]]; then
+        public_ip=$(getPublicIp)
+        [[ -z "$public_ip" ]] && die "Cannot auto-detect public IP. Use -i option."
+    fi
+    
+    # Check if interface exists
+    if [[ -z "$DRYRUN" ]] && interfaceStatus; then
+        echo "Interface $INTERFACE exists. Using existing settings."
+        BASEIP=$(getCurrentBaseIP)
+        MANAGERIP="${BASEIP}.1"
+        LISTENPORT=$(getCurrentSetting "listen-port")
+    fi
+    
+    ensureOutputDir
+    local outdir="$(getOutputDir)"
+    
+    # Generate hub keys
+    local hub_privkey hub_pubkey
+    local hub_key_file="$outdir/$(getManagerIP).privatekey.${INTERFACE}.script"
+    
+    if [[ -f "$hub_key_file" ]]; then
+        hub_privkey=$(cat "$hub_key_file")
+        echo "Using existing hub private key"
+    else
+        hub_privkey=$(generateKey)
+        writeKey "$(getManagerIP)" "$hub_privkey"
+        echo "Generated hub private key"
+    fi
+    hub_pubkey=$(getPublicKey "$hub_privkey")
+    
+    # Create interface (if not DRYRUN)
+    if [[ -z "$DRYRUN" ]]; then
+        if ! interfaceStatus; then
+            runCmd sudo ip link add dev "$INTERFACE" type wireguard
+            runCmd sudo ip addr add dev "$INTERFACE" "$(getManagerIP)/${MASK}"
+        fi
+        
+        # Set hub configuration
+        local psk_temp=$(mktemp)
+        echo "" > "$psk_temp"
+        runCmd sudo wg set "$INTERFACE" listen-port "$LISTENPORT" private-key "$hub_key_file"
+        rm -f "$psk_temp"
+        runCmd sudo ip link set up dev "$INTERFACE"
+        
+        # Add route
+        runCmd sudo ip route add "${BASEIP}.0/24" dev "$INTERFACE" 2>/dev/null || true
+    fi
+    
+    # Generate peer configs
+    local last_ip=1
+    for ((i=1; i<=count; i++)); do
+        ((last_ip++))
+        local peer_ip="${BASEIP}.${last_ip}"
+        local peer_key_file="$outdir/${peer_ip}.privatekey.${INTERFACE}.script"
+        
+        # Generate peer keys
+        local peer_privkey peer_pubkey psk
+        peer_privkey=$(generateKey)
+        peer_pubkey=$(getPublicKey "$peer_privkey")
+        psk=$(generatePSK)
+        
+        writeKey "$peer_ip" "$peer_privkey"
+        
+        # Generate peer config
+        local peer_config
+        peer_config=$(generatePeerConfig "$peer_ip" "$peer_privkey" "$hub_pubkey" "$psk" "${public_ip}:${LISTENPORT}")
+        
+        if writeFileWithConfirm "config.peer.${peer_ip}" "$peer_config"; then
+            # Generate QR code
+            if checkCommand qrencode; then
+                local qr_file="$outdir/config.peer.${peer_ip}.png"
+                qrencode -r "$outdir/config.peer.${peer_ip}" -o "$qr_file" 2>/dev/null && echo "QR code: $qr_file"
+            fi
+            
+            # Add peer to interface (if not DRYRUN)
+            if [[ -z "$DRYRUN" ]]; then
+                local psk_temp=$(mktemp)
+                echo "$psk" > "$psk_temp"
+                runCmd sudo wg set "$INTERFACE" peer "$peer_pubkey" allowed-ips "${peer_ip}/${MASK}" preshared-key "$psk_temp" persistent-keepalive "$KEEPALIVE_TIMEOUT"
+                rm -f "$psk_temp"
+            fi
+        fi
+    done
+    
+    # Generate hub config
+    local hub_config
+    hub_config=$(generateHubConfig "$hub_privkey")
+    writeFileWithConfirm "config.hub.$(getManagerIP)" "$hub_config"
+    
+    echo ""
+    echo "=========================================="
+    echo "Generated WireGuard setup: $INTERFACE"
+    echo "Hub: $(getManagerIP), Port: $LISTENPORT"
+    echo "Peers generated: $count"
+    [[ -z "$DRYRUN" ]] && echo "Interface is UP and configured"
+    echo "=========================================="
+}
+
+cmd_create() {
+    # Reset defaults for this command
+    BASEIP="192.168.88"
+    MANAGERIP="${BASEIP}.1"
+    FORCE_OVERWRITE=0
+    local public_ip="" preshared_key="" private_key="" public_key=""
+    
+    while getopts ":hw:b:p:d:m:i:s:r:l:e:f" o; do
+        case "${o}" in
+            f) FORCE_OVERWRITE=1 ;;
+            w) INTERFACE="$OPTARG" ;;
+            b) BASEIP="$OPTARG"; MANAGERIP="${BASEIP}.1" ;;
+            p) LISTENPORT="$OPTARG" ;;
+            d) DNS_SERVER="$OPTARG" ;;
+            m) MTU_VALUE="$OPTARG" ;;
+            i) public_ip="$OPTARG" ;;
+            s) preshared_key="$OPTARG" ;;
+            r) private_key="$OPTARG" ;;
+            l) public_key="$OPTARG" ;;
+            e) local peer_ip="$OPTARG" ;;
+            h) usage ;;
+            :) die "Option -$OPTARG requires an argument" ;;
+            ?) die "Invalid option: -$OPTARG" ;;
+        esac
+    done
+    
+    # Check if interface exists
+    if [[ -z "$DRYRUN" ]] && ! interfaceStatus; then
+        die "Interface $INTERFACE does not exist. Use 'generate' first."
+    fi
+    
+    # Get current settings from existing interface
+    if [[ -z "$DRYRUN" ]]; then
+        BASEIP=$(getCurrentBaseIP)
+        MANAGERIP="${BASEIP}.1"
+        LISTENPORT=$(getCurrentSetting "listen-port")
+    fi
+    
+    # Find free IP
+    local edge_ip
+    if [[ -n "$peer_ip" ]]; then
+        edge_ip="$peer_ip"
+    else
+        edge_ip=$(findFreeIP)
+    fi
+    
+    # Get hub public key
+    local outdir="$(getOutputDir)"
+    ensureOutputDir
+    local hub_key_file="$outdir/$(getManagerIP).privatekey.${INTERFACE}.script"
+    local hub_pubkey
+    if [[ -f "$hub_key_file" ]]; then
+        hub_pubkey=$(cat "$hub_key_file" | wg pubkey)
+    else
+        die "Hub key not found. Run 'generate' first."
+    fi
+    
+    # Generate or use provided peer keys
+    if [[ -z "$private_key" ]]; then
+        private_key=$(generateKey)
+    fi
+    if [[ -z "$public_key" ]]; then
+        public_key=$(getPublicKey "$private_key")
+    fi
+    if [[ -z "$preshared_key" ]]; then
+        preshared_key=$(generatePSK)
+    fi
+    
+    # Save peer key
+    writeKey "$edge_ip" "$private_key"
+    
+    # Get public IP for endpoint
+    if [[ -z "$public_ip" ]]; then
+        public_ip=$(getPublicIp)
+    fi
+    
+    # Generate peer config
+    local peer_config
+    peer_config=$(generatePeerConfig "$edge_ip" "$private_key" "$hub_pubkey" "$preshared_key" "${public_ip}:${LISTENPORT}")
+    writeFileWithConfirm "config.peer.${edge_ip}" "$peer_config"
+    
+    # Generate QR code
+    if checkCommand qrencode; then
+        local qr_file="$outdir/config.peer.${edge_ip}.png"
+        qrencode -r "$outdir/config.peer.${edge_ip}" -o "$qr_file" 2>/dev/null && echo "QR code: $qr_file"
+    fi
+    
+    # Add peer to interface (if not DRYRUN)
+    if [[ -z "$DRYRUN" ]]; then
+        local psk_temp=$(mktemp)
+        echo "$preshared_key" > "$psk_temp"
+        runCmd sudo wg set "$INTERFACE" peer "$public_key" allowed-ips "${edge_ip}/${MASK},${EXTRA_ALLOWED_IP}" preshared-key "$psk_temp" endpoint "${public_ip}:${LISTENPORT}" persistent-keepalive "$KEEPALIVE_TIMEOUT"
+        rm -f "$psk_temp"
+        
+        # Update hub config file
+        runCmd sudo wg show "$INTERFACE" > "$outdir/wg-show-backup.txt" 2>/dev/null || true
+    fi
+    
+    # Regenerate hub config to include new peer
+    local hub_privkey=$(cat "$hub_key_file")
+    local hub_config=$(generateHubConfig "$hub_privkey")
+    writeFileWithConfirm "config.hub.$(getManagerIP)" "$hub_config"
+    
+    echo ""
+    echo "=========================================="
+    echo "Created new peer: $edge_ip"
+    echo "Interface: $INTERFACE"
+    echo "=========================================="
+    echo ""
+    echo "Peer config:"
+    cat "$outdir/config.peer.${edge_ip}"
+}
+
 cmd_verify() {
     # Reset defaults for this command
     BASEIP="192.168.88"
@@ -549,8 +805,7 @@ cmd_clean() {
     
     if [[ -z "$DRYRUN" ]]; then
         sudo ip link del "$INTERFACE" 2>/dev/null && echo "Removed interface $INTERFACE"
-        sudo rm -f "/etc/wireguard/${INTERFACE}.conf" 2>/dev/null
-        sudo rm -rf "$outdir" 2>/dev/null && echo "Removed $outdir"
+        rm -rf "$outdir" 2>/dev/null && echo "Removed $outdir"
     else
         echo "[DRYRUN] Would remove interface and $outdir"
     fi
@@ -571,14 +826,11 @@ shift
 
 case "$COMMAND" in
     prepare) cmd_prepare "$@" ;;
+    generate) cmd_generate "$@" ;;
+    create) cmd_create "$@" ;;
     recreate) cmd_recreate "$@" ;;
     verify) cmd_verify "$@" ;;
     clean) cmd_clean "$@" ;;
-    generate|create)
-        # Not yet refactored in this version
-        echo "Command '$COMMAND' not yet implemented in v2 - use prepare/recreate/verify/clean"
-        exit 1
-        ;;
     help|--help|-h) usage ;;
     *) die "Unknown command: $COMMAND" ;;
 esac
