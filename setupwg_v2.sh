@@ -222,6 +222,10 @@ Commands:
     create [-w interface] [-b baseip] [-p port] [-d dns] [-m mtu] [-i ip] [-s psk] [-r privkey] [-l pubkey] [-e ip]
         Create new peer for existing WireGuard setup (adds to system interface)
     
+    join [-w interface] [-f <file>]
+        Join a WireGuard network as a peer (run on peer computer)
+        Config can be from file (-f) or piped via stdin (copy-paste)
+    
     recreate [-w interface] [-t hub|peer|all] [-f]
         Recreate configs from existing keys (use -i to update endpoint, -f to force)
     
@@ -792,6 +796,146 @@ cmd_verify() {
     fi
 }
 
+cmd_join() {
+    # Join an existing WireGuard network as a peer
+    local config_file="" config_content=""
+    
+    while getopts ":hw:f:c:" o; do
+        case "${o}" in
+            w) INTERFACE="$OPTARG" ;;
+            f) config_file="$OPTARG" ;;
+            c) config_content="$OPTARG" ;;
+            h) usage ;;
+            :) die "Option -$OPTARG requires an argument" ;;
+            ?) die "Invalid option: -$OPTARG" ;;
+        esac
+    done
+    
+    # Check if we have config from file, -c option, or stdin
+    if [[ -z "$config_file" && -z "$config_content" ]]; then
+        # Try to read from stdin (for heredoc/copy-paste)
+        if [[ ! -t 0 ]]; then
+            config_content=$(cat)
+        fi
+    fi
+    
+    [[ -z "$config_file" && -z "$config_content" ]] && die "No config provided. Use -f <file> or pipe config via stdin"
+    
+    # Read config content
+    local config_data
+    if [[ -n "$config_file" ]]; then
+        [[ -f "$config_file" ]] || die "Config file not found: $config_file"
+        config_data=$(cat "$config_file")
+        echo "Using config from: $config_file"
+    else
+        config_data="$config_content"
+        echo "Using config from stdin/argument"
+    fi
+    
+    # Parse config
+    local privkey=$(echo "$config_data" | grep "^PrivateKey = " | cut -d' ' -f3)
+    local address=$(echo "$config_data" | grep "^Address = " | cut -d' ' -f3)
+    local listen_port=$(echo "$config_data" | grep "^ListenPort = " | cut -d' ' -f3)
+    local dns=$(echo "$config_data" | grep "^DNS = " | cut -d' ' -f3)
+    local mtu=$(echo "$config_data" | grep "^MTU = " | cut -d' ' -f3)
+    
+    # Parse [Peer] section (the hub)
+    local hub_pubkey=$(echo "$config_data" | grep "^PublicKey = " | head -1 | cut -d' ' -f3)
+    local psk=$(echo "$config_data" | grep "^PresharedKey = " | head -1 | cut -d' ' -f3)
+    local allowed_ips=$(echo "$config_data" | grep "^AllowedIPs = " | head -1 | cut -d' ' -f3-)
+    local endpoint=$(echo "$config_data" | grep "^Endpoint = " | head -1 | cut -d' ' -f3)
+    local keepalive=$(echo "$config_data" | grep "^PersistentKeepalive = " | head -1 | cut -d' ' -f3)
+    
+    # Validate required fields
+    [[ -z "$privkey" ]] && die "Config missing PrivateKey"
+    [[ -z "$address" ]] && die "Config missing Address"
+    [[ -z "$hub_pubkey" ]] && die "Config missing PublicKey (hub)"
+    [[ -z "$endpoint" ]] && die "Config missing Endpoint"
+    
+    echo ""
+    echo "=========================================="
+    echo "Joining WireGuard network as peer"
+    echo "Interface: $INTERFACE"
+    echo "Address: $address"
+    echo "Hub endpoint: $endpoint"
+    echo "=========================================="
+    
+    # Create output directory
+    ensureOutputDir
+    local outdir="$(getOutputDir)"
+    
+    # Save the config file locally
+    echo "$config_data" > "$outdir/config.joined"
+    chmod 600 "$outdir/config.joined"
+    echo "Config saved to: $outdir/config.joined"
+    
+    # Create interface (if not DRYRUN)
+    if [[ -z "$DRYRUN" ]]; then
+        # Delete existing interface if present
+        if interfaceStatus; then
+            echo "Removing existing interface $INTERFACE..."
+            sudo ip link del "$INTERFACE" 2>/dev/null || true
+        fi
+        
+        # Create interface
+        runCmd sudo ip link add dev "$INTERFACE" type wireguard
+        
+        # Set private key
+        local key_temp=$(mktemp)
+        echo "$privkey" > "$key_temp"
+        runCmd sudo wg set "$INTERFACE" private-key "$key_temp"
+        rm -f "$key_temp"
+        
+        # Add IP address
+        runCmd sudo ip addr add dev "$INTERFACE" "$address"
+        
+        # Add peer (the hub)
+        local psk_temp=$(mktemp)
+        echo "$psk" > "$psk_temp"
+        
+        # Build wg set command
+        local wg_cmd="sudo wg set $INTERFACE peer $hub_pubkey"
+        [[ -n "$psk" ]] && wg_cmd="$wg_cmd preshared-key $psk_temp"
+        [[ -n "$allowed_ips" ]] && wg_cmd="$wg_cmd allowed-ips $allowed_ips"
+        [[ -n "$endpoint" ]] && wg_cmd="$wg_cmd endpoint $endpoint"
+        [[ -n "$keepalive" ]] && wg_cmd="$wg_cmd persistent-keepalive $keepalive"
+        
+        runCmd eval "$wg_cmd"
+        rm -f "$psk_temp"
+        
+        # Bring up interface
+        runCmd sudo ip link set up dev "$INTERFACE"
+        
+        # Add routes for AllowedIPs
+        if [[ -n "$allowed_ips" ]]; then
+            IFS=',' read -ra ips <<< "$allowed_ips"
+            for ip in "${ips[@]}"; do
+                ip=$(echo "$ip" | xargs)  # trim
+                [[ "$ip" == "0.0.0.0/0" ]] && continue  # Skip default route for now
+                runCmd sudo ip route add "$ip" dev "$INTERFACE" 2>/dev/null || echo "Route $ip may already exist"
+            done
+        fi
+        
+        # Set DNS if provided (using resolvconf or systemd-resolved)
+        if [[ -n "$dns" ]]; then
+            echo "Note: DNS setting ($dns) should be configured manually or via wg-quick"
+        fi
+        
+        echo ""
+        echo "=========================================="
+        echo "Successfully joined network!"
+        echo "Interface $INTERFACE is UP"
+        echo "Run 'sudo wg show $INTERFACE' to verify"
+        echo "=========================================="
+    else
+        echo ""
+        echo "[DRYRUN] Would create interface $INTERFACE with:"
+        echo "  Address: $address"
+        echo "  Hub: $endpoint"
+        echo "  AllowedIPs: $allowed_ips"
+    fi
+}
+
 cmd_clean() {
     while getopts ":hw:" o; do
         case "${o}" in
@@ -830,6 +974,7 @@ case "$COMMAND" in
     create) cmd_create "$@" ;;
     recreate) cmd_recreate "$@" ;;
     verify) cmd_verify "$@" ;;
+    join) cmd_join "$@" ;;
     clean) cmd_clean "$@" ;;
     help|--help|-h) usage ;;
     *) die "Unknown command: $COMMAND" ;;
